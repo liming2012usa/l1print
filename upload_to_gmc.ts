@@ -255,10 +255,21 @@ function applyTemplate(template: string, product: FeedProduct): string {
 function sanitizeDescription(description?: string): string {
   if (!description) return '';
   const decoded = he.decode(description);
-  return decoded
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const withLineBreaks = decoded
+    .replace(/<\s*br\s*\/?>/gi, '\n')
+    .replace(/<\/\s*(p|div|h\d)\s*>/gi, '\n')
+    .replace(/<\s*(p|div|h\d)[^>]*>/gi, '\n')
+    .replace(/<\s*li[^>]*>\s*/gi, '\n• ')
+    .replace(/<\/\s*li\s*>/gi, '')
+    .replace(/<\/\s*(ul|ol)\s*>/gi, '\n');
+
+  const withoutTags = withLineBreaks.replace(/<[^>]*>/g, ' ');
+
+  return withoutTags
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter((line) => line.length > 0)
+    .join('\n');
 }
 
 function toArray<T>(value: T | T[] | undefined): T[] {
@@ -420,6 +431,14 @@ function buildColorAttribute(colors: string[]): string | undefined {
   return result;
 }
 
+function buildVariantOfferId(baseOfferId: string, size: string): string {
+  const sanitizedSize = size
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || 'variant';
+  return `${baseOfferId}-${sanitizedSize}`;
+}
+
 function buildProductSearchText(product: FeedProduct, productTypes: string[]): string {
   const parts: Array<string | undefined> = [
     product.name,
@@ -433,8 +452,9 @@ function buildProductSearchText(product: FeedProduct, productTypes: string[]): s
     .join(' ');
 }
 
-const FEMALE_KEYWORDS = ['women', 'womens', "women's", 'woman', "woman's", 'lady', 'ladies', 'female', 'girl', 'girls', "girls'", "girl's"];
-const MALE_KEYWORDS = ['men', 'mens', "men's", 'man', "man’s", 'male', 'boy', 'boys', "boys'", "boy's", 'guy', 'guys'];
+const FEMALE_KEYWORDS = ['women', 'womens', 'woman', "woman's", 'lady', 'ladies', 'female', 'girl', 'girls', "girls'", "girl's"];
+const MALE_KEYWORDS = ['men', 'mens', 'man', "man’s", 'male', 'boy', 'boys', "boys'", "boy's", 'guy', 'guys'];
+const UNISEX_KEYWORDS = ['unisex'];
 const AGE_KEYWORDS: Record<Exclude<AgeGroupValue, 'adult'>, string[]> = {
   newborn: ['newborn', 'new-born'],
   infant: ['infant', 'baby', 'layette'],
@@ -446,13 +466,36 @@ function inferGenderFromProduct(product: FeedProduct, productTypes: string[]): G
   const text = buildProductSearchText(product, productTypes);
   if (!text) return undefined;
 
-  const hasFemale = FEMALE_KEYWORDS.some((keyword) => text.includes(keyword));
-  const hasMale = MALE_KEYWORDS.some((keyword) => text.includes(keyword));
+  const normalized = [
+    (product.name ?? ''),
+    product.description ? he.decode(product.description) : '',
+    ...productTypes,
+  ]
+    .join(' ')
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ');
+  const tokens = normalized
+    .split(' ')
+    .map((token) => token.trim())
+    .filter((token) => Boolean(token));
+  const tokenSet = new Set(tokens);
+
+  if (UNISEX_KEYWORDS.some((keyword) => tokenSet.has(keyword))) {
+    return 'unisex';
+  }
+
+  const hasFemale = FEMALE_KEYWORDS.some((keyword) => tokenSet.has(keyword));
+  const hasMale = MALE_KEYWORDS.some((keyword) => tokenSet.has(keyword));
+
+  if (!hasFemale && /women/i.test(product.name ?? '')) {
+    console.log('Gender inference fallback for product', product.id || product.code, 'text sample:', normalized.slice(0, 120));
+  }
 
   if (hasFemale && hasMale) return 'unisex';
   if (hasFemale) return 'female';
   if (hasMale) return 'male';
-  return undefined;
+  return 'male';
 }
 
 function inferAgeGroupFromProduct(product: FeedProduct, productTypes: string[]): AgeGroupValue | undefined {
@@ -549,7 +592,7 @@ function mapFeedProductToGoogleProduct(
   options: MappingOptions,
   categoryMap: Record<string, string>,
   manufacturerMap: Record<string, string>,
-): SchemaProduct {
+): SchemaProduct[] {
   const priceValue = Number(product.price ?? product.cheapest_price ?? 0);
   const templatePath = applyTemplate(options.productPathTemplate, product);
   const productLink = ensureAbsoluteUrl(options.baseStoreUrl, templatePath) ?? options.baseStoreUrl;
@@ -562,7 +605,7 @@ function mapFeedProductToGoogleProduct(
   const [primaryImage, ...additionalImages] = imageLinks;
 
   const sanitizedDescription = sanitizeDescription(product.description || String(product.name || ''));
-  const offerId = product.code || product.id || slugify(product.name) || `product-${Date.now()}`;
+  const baseOfferId = product.code || product.id || slugify(product.name) || `product-${Date.now()}`;
   const sizes = extractProductSizes(product);
   const colors = extractProductColors(product);
   const productTypes = extractProductCategories(product, categoryMap);
@@ -572,9 +615,9 @@ function mapFeedProductToGoogleProduct(
     ? manufacturerMap[String(product.manufacturer_id)] ?? String(product.manufacturer_id)
     : undefined;
 
-  const googleProduct: SchemaProduct = {
-    offerId,
-    title: product.name?.trim() || offerId,
+  const baseProduct = {
+    itemGroupId: product.code || product.id,
+    title: product.name?.trim() || baseOfferId,
     description: sanitizedDescription,
     link: productLink,
     imageLink: primaryImage,
@@ -594,14 +637,32 @@ function mapFeedProductToGoogleProduct(
     mpn: product.code,
     googleProductCategory: options.defaultGpc,
     customLabel0: product.type_id ? String(product.type_id) : undefined,
-    size: buildSizeAttribute(sizes),
     color: buildColorAttribute(colors),
     gender,
     ageGroup,
     productTypes: productTypes.length ? productTypes : undefined,
   };
 
-  return googleProduct;
+  if (!sizes.length) {
+    return [
+      {
+        ...baseProduct,
+        offerId: baseOfferId,
+      },
+    ];
+  }
+
+  return sizes.map((size) => {
+    const variant: SchemaProduct = {
+      ...baseProduct,
+      offerId: buildVariantOfferId(baseOfferId, size),
+      itemGroupId: baseProduct.itemGroupId ?? baseOfferId,
+      sizes: [size],
+    };
+    variant.gender = gender;
+    variant.ageGroup = ageGroup;
+    return variant;
+  });
 }
 
 async function createContentClient() {
@@ -646,7 +707,7 @@ async function uploadProducts(
         merchantId,
         requestBody: product,
       });
-      console.log(`Uploaded product ${product.offerId}`);
+      console.log(`Uploaded product ${product.offerId} (size: ${product.sizes?.[0] ?? 'n/a'}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'})`);
       report.success += 1;
     } catch (error) {
       console.error(`Failed to upload product ${product.offerId}:`, error);
@@ -700,10 +761,10 @@ async function main() {
     ? feedProducts.slice(0, cliOptions.limit)
     : feedProducts;
 
-  const googleProducts = selectedProducts.map((item) =>
+  const googleProducts = selectedProducts.flatMap((item) =>
     mapFeedProductToGoogleProduct(item, mappingOptions, categoryMap, manufacturerMap),
   );
-  console.log(`Prepared ${googleProducts.length} products for upload.`);
+  console.log(`Prepared ${googleProducts.length} variant products for upload.`);
 
   const contentApi = await createContentClient();
   await uploadProducts(googleProducts, merchantId, contentApi, cliOptions.dryRun);
