@@ -1,0 +1,25 @@
+{
+  "name": "l1print-deconetwork-feed",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "fetch_deconetwork_feed.mjs",
+  "scripts": {
+    "start": "node fetch_deconetwork_feed.mjs",
+    "build": "tsc",
+    "upload:gmc": "npm run build --silent && node dist/upload_to_gmc.js --limit 3",
+    "upload:gmc:ts": "node run-upload-to-gmc.cjs --limit 3"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.10",
+    "dotenv": "^17.2.3",
+    "googleapis": "^132.0.0",
+    "he": "^1.2.0",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "@types/he": "^1.2.3",
+    "@types/xml2js": "^0.4.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.0"
+  }
+}
