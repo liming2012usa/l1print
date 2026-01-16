@@ -1,6 +1,8 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createHash } from 'node:crypto';
+import Database from 'better-sqlite3';
 import { google, content_v2_1 } from 'googleapis';
 import type { JWTInput } from 'google-auth-library';
 import { parseStringPromise } from 'xml2js';
@@ -105,8 +107,21 @@ interface MetaManufacturer {
   name?: string;
 }
 
+interface CachedVariantRecord {
+  offerId: string;
+  itemGroupId?: string;
+  hash: string;
+  updatedAt: number;
+}
+
+interface UploadQueueItem {
+  product: SchemaProduct;
+  hash: string;
+}
+
 const DEFAULT_XML_PATH = path.resolve(__dirname, 'data_feeds', 'products.xml');
 const DEFAULT_META_PATH = path.resolve(__dirname, 'data_feeds', 'meta_data.xml');
+const DB_PATH = path.resolve(__dirname, '.cache', 'gmc-sync.db');
 const COLOR_ATTRIBUTE_MAX_LENGTH = 100;
 const DEFAULT_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
@@ -327,6 +342,120 @@ async function loadMetaDataMaps(metaPath: string): Promise<MetaDataMaps> {
   } catch (error) {
     console.warn(`Unable to load metadata from ${metaPath}:`, error instanceof Error ? error.message : error);
     return { categories: {}, manufacturers: {} };
+  }
+}
+
+let dbInstance: Database.Database | null = null;
+
+async function getDatabase(): Promise<Database.Database> {
+  if (dbInstance) {
+    return dbInstance;
+  }
+  await mkdir(path.dirname(DB_PATH), { recursive: true });
+  const instance = new Database(DB_PATH);
+  instance.pragma('journal_mode = WAL');
+  instance.exec(`
+    CREATE TABLE IF NOT EXISTS product_variants (
+      offer_id TEXT PRIMARY KEY,
+      item_group_id TEXT,
+      hash TEXT NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  dbInstance = instance;
+  return instance;
+}
+
+function loadCachedVariants(db: Database.Database): Map<string, CachedVariantRecord> {
+  const stmt = db.prepare('SELECT offer_id AS offerId, item_group_id AS itemGroupId, hash, updated_at AS updatedAt FROM product_variants');
+  const rows = stmt.all() as CachedVariantRecord[];
+  const map = new Map<string, CachedVariantRecord>();
+  for (const row of rows) {
+    map.set(row.offerId, row);
+  }
+  return map;
+}
+
+function upsertVariantRecord(db: Database.Database, record: CachedVariantRecord): void {
+  const stmt = db.prepare(`
+    INSERT INTO product_variants (offer_id, item_group_id, hash, updated_at)
+    VALUES (@offerId, @itemGroupId, @hash, @updatedAt)
+    ON CONFLICT(offer_id) DO UPDATE SET
+      item_group_id=excluded.item_group_id,
+      hash=excluded.hash,
+      updated_at=excluded.updated_at
+  `);
+  stmt.run(record);
+}
+
+function deleteVariantRecords(db: Database.Database, offerIds: string[]): void {
+  if (!offerIds.length) return;
+  const stmt = db.prepare('DELETE FROM product_variants WHERE offer_id = ?');
+  for (const offerId of offerIds) {
+    stmt.run(offerId);
+  }
+}
+
+function hashProduct(product: SchemaProduct): string {
+  const payload = {
+    offerId: product.offerId,
+    itemGroupId: product.itemGroupId,
+    title: product.title,
+    description: product.description,
+    link: product.link,
+    imageLink: product.imageLink,
+    additionalImageLinks: product.additionalImageLinks,
+    contentLanguage: product.contentLanguage,
+    targetCountry: product.targetCountry,
+    channel: product.channel,
+    availability: product.availability,
+    condition: product.condition,
+    price: product.price,
+    brand: product.brand,
+    mpn: product.mpn,
+    googleProductCategory: product.googleProductCategory,
+    customLabel0: product.customLabel0,
+    sizes: product.sizes,
+    color: product.color,
+    gender: product.gender,
+    ageGroup: product.ageGroup,
+    productTypes: product.productTypes,
+  };
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+function createRestProductId(offerId: string, mapping: MappingOptions): string {
+  return `${mapping.channel}:${mapping.contentLanguage}:${mapping.targetCountry}:${offerId}`;
+}
+
+async function deleteStaleProducts(
+  offerIds: string[],
+  merchantId: string,
+  mappingOptions: MappingOptions,
+  contentApi: content_v2_1.Content,
+  db: Database.Database,
+  dryRun: boolean,
+): Promise<void> {
+  if (!offerIds.length) {
+    return;
+  }
+
+  for (const offerId of offerIds) {
+    if (dryRun) {
+      console.log(`[dry-run] Would delete product ${offerId}`);
+      continue;
+    }
+
+    try {
+      await contentApi.products.delete({
+        merchantId,
+        productId: createRestProductId(offerId, mappingOptions),
+      });
+      deleteVariantRecords(db, [offerId]);
+      console.log(`Deleted product ${offerId}`);
+    } catch (error) {
+      console.error(`Failed to delete product ${offerId}:`, error);
+    }
   }
 }
 
@@ -679,17 +808,23 @@ async function createContentClient() {
 }
 
 async function uploadProducts(
-  products: SchemaProduct[],
+  items: UploadQueueItem[],
   merchantId: string,
   contentApi: content_v2_1.Content,
+  db: Database.Database,
   dryRun: boolean,
 ) {
+  if (!items.length) {
+    console.log('No product updates detected.');
+    return;
+  }
+
   const report = {
     success: 0,
     failed: 0,
   };
 
-  for (const product of products) {
+  for (const { product, hash } of items) {
     if (!product.offerId) {
       console.warn('Skipping product with missing offerId.');
       report.failed += 1;
@@ -709,6 +844,12 @@ async function uploadProducts(
       });
       console.log(`Uploaded product ${product.offerId} (size: ${product.sizes?.[0] ?? 'n/a'}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'})`);
       report.success += 1;
+      upsertVariantRecord(db, {
+        offerId: product.offerId,
+        itemGroupId: product.itemGroupId ?? undefined,
+        hash,
+        updatedAt: Date.now(),
+      });
     } catch (error) {
       console.error(`Failed to upload product ${product.offerId}:`, error);
       report.failed += 1;
@@ -753,8 +894,7 @@ async function main() {
   console.log(`Loading feed from: ${cliOptions.xmlPath}`);
   const feedProducts = await loadFeedProducts(cliOptions.xmlPath);
   if (!feedProducts.length) {
-    console.warn('No products found in the feed.');
-    return;
+    console.warn('No products found in the feed. Proceeding to check for stale products to delete.');
   }
 
   const selectedProducts = typeof cliOptions.limit === 'number'
@@ -764,10 +904,42 @@ async function main() {
   const googleProducts = selectedProducts.flatMap((item) =>
     mapFeedProductToGoogleProduct(item, mappingOptions, categoryMap, manufacturerMap),
   );
-  console.log(`Prepared ${googleProducts.length} variant products for upload.`);
+  console.log(`Prepared ${googleProducts.length} variant products for evaluation.`);
+
+  const db = await getDatabase();
+  const cachedVariants = loadCachedVariants(db);
+  const seenOfferIds = new Set<string>();
+  const uploadQueue: UploadQueueItem[] = [];
+
+  for (const product of googleProducts) {
+    if (!product.offerId) continue;
+    seenOfferIds.add(product.offerId);
+    const hash = hashProduct(product);
+    const cached = cachedVariants.get(product.offerId);
+    if (cached && cached.hash === hash) {
+      continue;
+    }
+    uploadQueue.push({ product, hash });
+  }
+
+  const staleOfferIds = Array.from(cachedVariants.keys()).filter((offerId) => !seenOfferIds.has(offerId));
+
+  if (!uploadQueue.length) {
+    console.log('No new or updated products detected in the current feed.');
+  } else {
+    console.log(`Detected ${uploadQueue.length} products that need to be created or updated.`);
+  }
+  if (staleOfferIds.length) {
+    console.log(`Detected ${staleOfferIds.length} products that need to be deleted.`);
+  }
 
   const contentApi = await createContentClient();
-  await uploadProducts(googleProducts, merchantId, contentApi, cliOptions.dryRun);
+
+  if (staleOfferIds.length) {
+    await deleteStaleProducts(staleOfferIds, merchantId, mappingOptions, contentApi, db, cliOptions.dryRun);
+  }
+
+  await uploadProducts(uploadQueue, merchantId, contentApi, db, cliOptions.dryRun);
 }
 
 main().catch((error) => {
