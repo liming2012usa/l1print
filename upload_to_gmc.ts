@@ -2,7 +2,7 @@ import { readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import Database from 'better-sqlite3';
+import DatabaseConstructor from 'better-sqlite3';
 import { google, content_v2_1 } from 'googleapis';
 import type { JWTInput } from 'google-auth-library';
 import { parseStringPromise } from 'xml2js';
@@ -345,14 +345,16 @@ async function loadMetaDataMaps(metaPath: string): Promise<MetaDataMaps> {
   }
 }
 
-let dbInstance: Database.Database | null = null;
+type SqliteDatabase = InstanceType<typeof DatabaseConstructor>;
 
-async function getDatabase(): Promise<Database.Database> {
+let dbInstance: SqliteDatabase | null = null;
+
+async function getDatabase(): Promise<SqliteDatabase> {
   if (dbInstance) {
     return dbInstance;
   }
   await mkdir(path.dirname(DB_PATH), { recursive: true });
-  const instance = new Database(DB_PATH);
+  const instance = new DatabaseConstructor(DB_PATH);
   instance.pragma('journal_mode = WAL');
   instance.exec(`
     CREATE TABLE IF NOT EXISTS product_variants (
@@ -366,7 +368,7 @@ async function getDatabase(): Promise<Database.Database> {
   return instance;
 }
 
-function loadCachedVariants(db: Database.Database): Map<string, CachedVariantRecord> {
+function loadCachedVariants(db: SqliteDatabase): Map<string, CachedVariantRecord> {
   const stmt = db.prepare('SELECT offer_id AS offerId, item_group_id AS itemGroupId, hash, updated_at AS updatedAt FROM product_variants');
   const rows = stmt.all() as CachedVariantRecord[];
   const map = new Map<string, CachedVariantRecord>();
@@ -376,7 +378,7 @@ function loadCachedVariants(db: Database.Database): Map<string, CachedVariantRec
   return map;
 }
 
-function upsertVariantRecord(db: Database.Database, record: CachedVariantRecord): void {
+function upsertVariantRecord(db: SqliteDatabase, record: CachedVariantRecord): void {
   const stmt = db.prepare(`
     INSERT INTO product_variants (offer_id, item_group_id, hash, updated_at)
     VALUES (@offerId, @itemGroupId, @hash, @updatedAt)
@@ -388,7 +390,7 @@ function upsertVariantRecord(db: Database.Database, record: CachedVariantRecord)
   stmt.run(record);
 }
 
-function deleteVariantRecords(db: Database.Database, offerIds: string[]): void {
+function deleteVariantRecords(db: SqliteDatabase, offerIds: string[]): void {
   if (!offerIds.length) return;
   const stmt = db.prepare('DELETE FROM product_variants WHERE offer_id = ?');
   for (const offerId of offerIds) {
@@ -433,7 +435,7 @@ async function deleteStaleProducts(
   merchantId: string,
   mappingOptions: MappingOptions,
   contentApi: content_v2_1.Content,
-  db: Database.Database,
+  db: SqliteDatabase,
   dryRun: boolean,
 ): Promise<void> {
   if (!offerIds.length) {
@@ -811,7 +813,7 @@ async function uploadProducts(
   items: UploadQueueItem[],
   merchantId: string,
   contentApi: content_v2_1.Content,
-  db: Database.Database,
+  db: SqliteDatabase,
   dryRun: boolean,
 ) {
   if (!items.length) {
