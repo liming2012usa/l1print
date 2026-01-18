@@ -736,7 +736,11 @@ function mapFeedProductToGoogleProduct(
   const [primaryImage, ...additionalImages] = imageLinks;
 
   const sanitizedDescription = sanitizeDescription(product.description || String(product.name || ''));
-  const baseOfferId = product.code || product.id || slugify(product.name) || `product-${Date.now()}`;
+  const productIdPart = product.id ? String(product.id) : undefined;
+  const codePart = product.code ? String(product.code) : undefined;
+  const baseOfferId = codePart && productIdPart
+    ? `${codePart}-${productIdPart}`
+    : (productIdPart ?? codePart ?? slugify(product.name)) ?? `product-${Date.now()}`;
   const sizes = extractProductSizes(product);
   const colors = extractProductColors(product);
   const productTypes = extractProductCategories(product, categoryMap);
