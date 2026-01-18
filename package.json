@@ -7,8 +7,8 @@
     "start": "node fetch_deconetwork_feed.mjs",
     "build": "tsc",
     "upload:gmc": "npm run build --silent && node dist/upload_to_gmc.js --limit 3",
-    "upload:gmc:ts": "node --loader ts-node/esm upload_to_gmc.ts --limit 3",
-    "delete:gmc": "node --loader ts-node/esm delete_products.ts --file data_feeds/products-delete.xml"
+    "upload:gmc:ts": "npx tsx upload_to_gmc.ts --limit 3",
+    "delete:gmc": "npx tsx delete_products.ts --file data_feeds/products-delete.xml"
   },
   "dependencies": {
     "adm-zip": "^0.5.10",
@@ -23,6 +23,7 @@
     "@types/he": "^1.2.3",
     "@types/xml2js": "^0.4.14",
     "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.0"
   }
 }
