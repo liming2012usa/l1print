@@ -161,10 +161,11 @@ async function deleteProducts(
 
   const contentApi = await createContentClient();
 
-  for (const offerId of offerIds) {
+  for (let index = 0; index < offerIds.length; index += 1) {
+    const offerId = offerIds[index];
     const restId = createRestProductId(offerId, mapping);
     if (dryRun) {
-      console.log(`[dry-run] Would delete product ${restId}`);
+      console.log(`[dry-run] (${index + 1}/${offerIds.length}) Would delete product ${restId}`);
       continue;
     }
     try {
@@ -172,7 +173,7 @@ async function deleteProducts(
         merchantId,
         productId: restId,
       });
-      console.log(`Deleted product ${restId}`);
+      console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
     } catch (error) {
       console.error(`Failed to delete product ${restId}:`, error);
     }
