@@ -47,6 +47,7 @@ This is equivalent to `node --loader ts-node/esm upload_to_gmc.ts --dry-run`. Re
 - `--xml ./path/to/products.xml` – override the feed path (defaults to `./data_feeds/products.xml`).
 - `--meta ./path/to/meta_data.xml` – override the category metadata path (defaults to `./data_feeds/meta_data.xml`).
 - `--limit 25` – only process the first N products.
+- `--infer-description` – allow gender/age heuristics to examine the product description (default is *off*; only the name/code/categories are scanned).
 - `--dry-run` – validate parsing/mapping without creating products in GMC.
 
 ### What the script does

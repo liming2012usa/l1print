@@ -21,6 +21,7 @@ interface CliOptions {
   metaPath: string;
   dryRun: boolean;
   limit?: number;
+  includeDescriptionInInference: boolean;
 }
 
 type GenderValue = 'male' | 'female' | 'unisex';
@@ -37,6 +38,10 @@ interface MappingOptions {
   defaultAvailability: string;
   defaultCondition: string;
   defaultGpc?: string;
+}
+
+interface InferenceOptions {
+  includeDescription: boolean;
 }
 
 interface FeedProduct {
@@ -123,7 +128,8 @@ const DEFAULT_XML_PATH = path.resolve(__dirname, 'data_feeds', 'products.xml');
 const DEFAULT_META_PATH = path.resolve(__dirname, 'data_feeds', 'meta_data.xml');
 const DB_PATH = path.resolve(__dirname, '.cache', 'gmc-sync.db');
 const COLOR_ATTRIBUTE_MAX_LENGTH = 100;
-const DEFAULT_GENDER: GenderValue = 'unisex';
+const DEFAULT_GENDER: GenderValue = 'male';
+const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
 
 function initializeEnv() {
@@ -154,6 +160,7 @@ function parseCliArgs(args: string[]): CliOptions {
   let metaPath = DEFAULT_META_PATH;
   let dryRun = false;
   let limit: number | undefined;
+  let includeDescriptionInInference = false;
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -172,6 +179,10 @@ function parseCliArgs(args: string[]): CliOptions {
       metaPath = resolvePath(value);
     } else if (arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--infer-description') {
+      includeDescriptionInInference = true;
+    } else if (arg === '--no-infer-description') {
+      includeDescriptionInInference = false;
     } else if (arg === '--limit' && args[i + 1]) {
       limit = parseLimit(args[i + 1]);
       i += 1;
@@ -181,7 +192,7 @@ function parseCliArgs(args: string[]): CliOptions {
     }
   }
 
-  return { xmlPath, metaPath, dryRun, limit };
+  return { xmlPath, metaPath, dryRun, limit, includeDescriptionInInference };
 }
 
 function resolvePath(inputPath?: string): string {
@@ -570,17 +581,25 @@ function buildVariantOfferId(baseOfferId: string, size: string): string {
   return `${baseOfferId}-${sanitizedSize}`;
 }
 
-function buildProductSearchText(product: FeedProduct, productTypes: string[]): string {
-  const parts: Array<string | undefined> = [
-    product.name,
-    product.description ? he.decode(product.description) : undefined,
-    product.code,
-    ...productTypes,
-  ];
-  return parts
+function buildTokenSet(sources: Array<string | undefined>): Set<string> {
+  const normalized = sources
     .map((part) => part?.toLowerCase() ?? '')
-    .filter((part) => Boolean(part))
-    .join(' ');
+    .filter(Boolean)
+    .join(' ')
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+  if (!normalized) {
+    return new Set();
+  }
+
+  return new Set(
+    normalized
+      .split(' ')
+      .map((token) => token.trim())
+      .filter(Boolean),
+  );
 }
 
 const FEMALE_KEYWORDS = ['women', 'womens', 'woman', "woman's", 'lady', 'ladies', 'female', 'girl', 'girls', "girls'", "girl's"];
@@ -593,24 +612,17 @@ const AGE_KEYWORDS: Record<Exclude<AgeGroupValue, 'adult'>, string[]> = {
   kids: ['youth', 'kid', 'kids', 'child', 'children', 'teen', 'junior', 'boys', 'girls'],
 };
 
-function inferGenderFromProduct(product: FeedProduct, productTypes: string[]): GenderValue | undefined {
-  const text = buildProductSearchText(product, productTypes);
-  if (!text) return undefined;
-
-  const normalized = [
-    (product.name ?? ''),
-    product.description ? he.decode(product.description) : '',
-    ...productTypes,
-  ]
-    .join(' ')
-    .toLowerCase()
-    .replace(/['’]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ');
-  const tokens = normalized
-    .split(' ')
-    .map((token) => token.trim())
-    .filter((token) => Boolean(token));
-  const tokenSet = new Set(tokens);
+function inferGenderFromProduct(
+  product: FeedProduct,
+  productTypes: string[],
+  options: InferenceOptions,
+): GenderValue | undefined {
+  const tokenSet = buildTokenSet([product.name, product.code, ...productTypes]);
+  if (options.includeDescription) {
+    const descriptionTokens = buildTokenSet([product.description ? he.decode(product.description) : undefined]);
+    descriptionTokens.forEach((token) => tokenSet.add(token));
+  }
+  if (!tokenSet.size) return DEFAULT_GENDER;
 
   if (UNISEX_KEYWORDS.some((keyword) => tokenSet.has(keyword))) {
     return 'unisex';
@@ -619,26 +631,30 @@ function inferGenderFromProduct(product: FeedProduct, productTypes: string[]): G
   const hasFemale = FEMALE_KEYWORDS.some((keyword) => tokenSet.has(keyword));
   const hasMale = MALE_KEYWORDS.some((keyword) => tokenSet.has(keyword));
 
-  if (!hasFemale && /women/i.test(product.name ?? '')) {
-    console.log('Gender inference fallback for product', product.id || product.code, 'text sample:', normalized.slice(0, 120));
-  }
-
   if (hasFemale && hasMale) return 'unisex';
   if (hasFemale) return 'female';
   if (hasMale) return 'male';
-  return 'male';
+  return DEFAULT_GENDER;
 }
 
-function inferAgeGroupFromProduct(product: FeedProduct, productTypes: string[]): AgeGroupValue | undefined {
-  const text = buildProductSearchText(product, productTypes);
-  if (!text) return undefined;
+function inferAgeGroupFromProduct(
+  product: FeedProduct,
+  productTypes: string[],
+  options: InferenceOptions,
+): AgeGroupValue | undefined {
+  const tokenSet = buildTokenSet([product.name, product.code, ...productTypes]);
+  if (options.includeDescription) {
+    const descriptionTokens = buildTokenSet([product.description ? he.decode(product.description) : undefined]);
+    descriptionTokens.forEach((token) => tokenSet.add(token));
+  }
+  if (!tokenSet.size) return DEFAULT_AGE_GROUP;
 
-  if (AGE_KEYWORDS.newborn.some((keyword) => text.includes(keyword))) return 'newborn';
-  if (AGE_KEYWORDS.infant.some((keyword) => text.includes(keyword))) return 'infant';
-  if (AGE_KEYWORDS.toddler.some((keyword) => text.includes(keyword))) return 'toddler';
-  if (AGE_KEYWORDS.kids.some((keyword) => text.includes(keyword))) return 'kids';
-  if (text.includes('adult')) return 'adult';
-  return undefined;
+  if (AGE_KEYWORDS.newborn.some((keyword) => tokenSet.has(keyword))) return 'newborn';
+  if (AGE_KEYWORDS.infant.some((keyword) => tokenSet.has(keyword))) return 'infant';
+  if (AGE_KEYWORDS.toddler.some((keyword) => tokenSet.has(keyword))) return 'toddler';
+  if (AGE_KEYWORDS.kids.some((keyword) => tokenSet.has(keyword))) return 'kids';
+  if (tokenSet.has('adult')) return 'adult';
+  return DEFAULT_AGE_GROUP;
 }
 
 function extractProductCategories(
@@ -723,6 +739,7 @@ function mapFeedProductToGoogleProduct(
   options: MappingOptions,
   categoryMap: Record<string, string>,
   manufacturerMap: Record<string, string>,
+  inferenceOptions: InferenceOptions,
 ): SchemaProduct[] {
   const priceValue = Number(product.price ?? product.cheapest_price ?? 0);
   const templatePath = applyTemplate(options.productPathTemplate, product);
@@ -744,8 +761,9 @@ function mapFeedProductToGoogleProduct(
   const sizes = extractProductSizes(product);
   const colors = extractProductColors(product);
   const productTypes = extractProductCategories(product, categoryMap);
-  const gender = inferGenderFromProduct(product, productTypes) ?? DEFAULT_GENDER;
-  const ageGroup = inferAgeGroupFromProduct(product, productTypes) ?? DEFAULT_AGE_GROUP;
+  const genderInference = inferGenderFromProduct(product, productTypes, inferenceOptions) ?? DEFAULT_GENDER;
+  const ageGroup = inferAgeGroupFromProduct(product, productTypes, inferenceOptions) ?? DEFAULT_AGE_GROUP;
+  const gender = ageGroup === 'kids' ? DEFAULT_KIDS_GENDER : genderInference;
   const manufacturerName = product.manufacturer_id
     ? manufacturerMap[String(product.manufacturer_id)] ?? String(product.manufacturer_id)
     : undefined;
@@ -838,7 +856,7 @@ async function uploadProducts(
     }
 
     if (dryRun) {
-      console.log(`[dry-run] Would upload product ${product.offerId}`);
+      console.log(`[dry-run] Would upload product ${product.offerId} (size: ${product.sizes?.[0] ?? 'n/a'}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'})`);
       report.success += 1;
       continue;
     }
@@ -907,8 +925,12 @@ async function main() {
     ? feedProducts.slice(0, cliOptions.limit)
     : feedProducts;
 
+  const inferenceOptions: InferenceOptions = {
+    includeDescription: cliOptions.includeDescriptionInInference,
+  };
+
   const googleProducts = selectedProducts.flatMap((item) =>
-    mapFeedProductToGoogleProduct(item, mappingOptions, categoryMap, manufacturerMap),
+    mapFeedProductToGoogleProduct(item, mappingOptions, categoryMap, manufacturerMap, inferenceOptions),
   );
   console.log(`Prepared ${googleProducts.length} variant products for evaluation.`);
 
