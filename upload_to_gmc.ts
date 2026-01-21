@@ -132,6 +132,39 @@ const DEFAULT_GENDER: GenderValue = 'male';
 const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
 
+const FORCE_EXIT_ARM_DELAY_MS = 500;
+let stopRequested = false;
+let forceExitArmed = false;
+let forceExitTimer: NodeJS.Timeout | undefined;
+
+function armForceExit() {
+  if (forceExitTimer) {
+    clearTimeout(forceExitTimer);
+  }
+  forceExitTimer = setTimeout(() => {
+    forceExitArmed = true;
+  }, FORCE_EXIT_ARM_DELAY_MS);
+}
+
+process.on('SIGINT', () => {
+  if (!stopRequested) {
+    stopRequested = true;
+    forceExitArmed = false;
+    armForceExit();
+    console.log('\nInterrupt received. Finishing current task before exiting... (press Ctrl+C again to force quit)');
+    return;
+  }
+  if (!forceExitArmed) {
+    return;
+  }
+  console.log('\nForce exiting.');
+  process.exit(1);
+});
+
+function isStopRequested(): boolean {
+  return stopRequested;
+}
+
 function initializeEnv() {
   const searchPaths = [
     path.resolve(process.cwd(), '.env'),
@@ -454,6 +487,10 @@ async function deleteStaleProducts(
   }
 
   for (let index = 0; index < offerIds.length; index += 1) {
+    if (isStopRequested()) {
+      console.log('Stop requested. Halting product deletion loop.');
+      break;
+    }
     const offerId = offerIds[index];
     const restId = createRestProductId(offerId, mappingOptions);
     if (dryRun) {
@@ -960,6 +997,10 @@ async function uploadProducts(
   };
 
   for (let index = 0; index < items.length; index += 1) {
+    if (isStopRequested()) {
+      console.log('Stop requested. Halting product upload loop.');
+      break;
+    }
     const { product, hash } = items[index];
     const displayColor = product.color ?? 'n/a';
     const displaySize = product.sizes?.[0] ?? 'n/a';
