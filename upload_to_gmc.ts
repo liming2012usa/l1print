@@ -453,21 +453,23 @@ async function deleteStaleProducts(
     return;
   }
 
-  for (const offerId of offerIds) {
+  for (let index = 0; index < offerIds.length; index += 1) {
+    const offerId = offerIds[index];
+    const restId = createRestProductId(offerId, mappingOptions);
     if (dryRun) {
-      console.log(`[dry-run] Would delete product ${offerId}`);
+      console.log(`[dry-run] (${index + 1}/${offerIds.length}) Would delete product ${restId}`);
       continue;
     }
 
     try {
       await contentApi.products.delete({
         merchantId,
-        productId: createRestProductId(offerId, mappingOptions),
+        productId: restId,
       });
       deleteVariantRecords(db, [offerId]);
-      console.log(`Deleted product ${offerId}`);
+      console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
     } catch (error) {
-      console.error(`Failed to delete product ${offerId}:`, error);
+      console.error(`Failed to delete product ${restId}:`, error);
     }
   }
 }
@@ -501,7 +503,17 @@ async function loadInlineCredentialsFromEnv(): Promise<JWTInput | undefined> {
   }
 }
 
-function extractProductSizes(product: FeedProduct): string[] {
+const EXCLUDED_SIZE_TOKENS = new Set(['3XL', '4XL', '5XL']);
+
+function shouldExcludeSize(input: string): boolean {
+  const trimmed = input.trim().toUpperCase();
+  if (!trimmed) {
+    return false;
+  }
+  return EXCLUDED_SIZE_TOKENS.has(trimmed);
+}
+
+function extractProductSizes(product: FeedProduct): { values: string[], hadInput: boolean } {
   const sizeEntries = toArray(product.sizes?.size as FeedSize | FeedSize[] | undefined);
   const normalizedSizes: string[] = [];
   const seen = new Set<string>();
@@ -514,11 +526,17 @@ function extractProductSizes(product: FeedProduct): string[] {
     if (!normalized || seen.has(normalized)) {
       continue;
     }
+    if (shouldExcludeSize(normalized)) {
+      continue;
+    }
     seen.add(normalized);
     normalizedSizes.push(normalized);
   }
 
-  return normalizedSizes;
+  return {
+    values: normalizedSizes,
+    hadInput: sizeEntries.length > 0,
+  };
 }
 
 function extractProductColors(product: FeedProduct): string[] {
@@ -546,39 +564,13 @@ function extractProductColors(product: FeedProduct): string[] {
   return normalizedColors;
 }
 
-function buildColorAttribute(colors: string[]): string | undefined {
-  const sanitized = colors
-    .map((color) => color.trim())
-    .filter((color) => Boolean(color));
-  if (!sanitized.length) {
-    return undefined;
-  }
-
-  let result = '';
-  for (const color of sanitized) {
-    const candidate = result ? `${result},${color}` : color;
-    if (candidate.length <= COLOR_ATTRIBUTE_MAX_LENGTH) {
-      result = candidate;
-      continue;
-    }
-    if (!result) {
-      return color.slice(0, COLOR_ATTRIBUTE_MAX_LENGTH);
-    }
-    break;
-  }
-
-  if (!result) {
-    return undefined;
-  }
-  return result;
-}
-
-function buildVariantOfferId(baseOfferId: string, size: string): string {
-  const sanitizedSize = size
+function buildVariantOfferId(baseOfferId: string, color?: string): string {
+  const normalize = (value: string) => value
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '') || 'variant';
-  return `${baseOfferId}-${sanitizedSize}`;
+    .replace(/^-+|-+$/g, '');
+  const suffix = color ? normalize(color) : 'variant';
+  return `${baseOfferId}-${suffix}`;
 }
 
 function buildTokenSet(sources: Array<string | undefined>): Set<string> {
@@ -611,6 +603,54 @@ const AGE_KEYWORDS: Record<Exclude<AgeGroupValue, 'adult'>, string[]> = {
   toddler: ['toddler'],
   kids: ['youth', 'kid', 'kids', 'child', 'children', 'teen', 'junior', 'boys', 'girls'],
 };
+
+function buildColorGroups(colors: string[]): string[] {
+  if (!colors.length) return [];
+
+  const neutralSet = new Set<string>();
+  const blueSet = new Set<string>();
+  let hasOther = false;
+
+  for (const raw of colors) {
+    const value = raw.toLowerCase();
+
+    const matchedNeutral = ['black', 'white', 'grey', 'gray'].some((keyword) => {
+      if (value.includes(keyword)) {
+        if (keyword === 'white') neutralSet.add('White');
+        else if (keyword === 'black') neutralSet.add('Black');
+        else neutralSet.add('Grey');
+        return true;
+      }
+      return false;
+    });
+    const matchedBlue = ['navy', 'blue', 'royal'].some((keyword) => {
+      if (value.includes(keyword)) {
+        if (keyword === 'navy') blueSet.add('Navy');
+        else if (keyword === 'royal') blueSet.add('Royal');
+        else blueSet.add('Blue');
+        return true;
+      }
+      return false;
+    });
+
+    if (!matchedNeutral && !matchedBlue) {
+      hasOther = true;
+    }
+  }
+
+  const groups: string[] = [];
+  if (neutralSet.size) {
+    groups.push(Array.from(neutralSet).join('/'));
+  }
+  if (blueSet.size) {
+    groups.push(Array.from(blueSet).join('/'));
+  }
+  if (hasOther) {
+    groups.push('Multicolor');
+  }
+
+  return groups;
+}
 
 function inferGenderFromProduct(
   product: FeedProduct,
@@ -758,9 +798,18 @@ function mapFeedProductToGoogleProduct(
   const baseOfferId = codePart && productIdPart
     ? `${codePart}-${productIdPart}`
     : (productIdPart ?? codePart ?? slugify(product.name)) ?? `product-${Date.now()}`;
-  const sizes = extractProductSizes(product);
+  const itemGroupId = codePart && productIdPart
+    ? `${codePart}-${productIdPart}`
+    : (codePart ?? productIdPart);
+  const { values: sizes, hadInput: hadSizeEntries } = extractProductSizes(product);
+  if (hadSizeEntries && !sizes.length) {
+    return [];
+  }
   const colors = extractProductColors(product);
   const productTypes = extractProductCategories(product, categoryMap);
+  const colorGroups = buildColorGroups(colors);
+  const sizeValues = sizes.length ? sizes : [undefined];
+  const colorValues = colorGroups.length ? colorGroups : [undefined];
   const genderInference = inferGenderFromProduct(product, productTypes, inferenceOptions) ?? DEFAULT_GENDER;
   const ageGroup = inferAgeGroupFromProduct(product, productTypes, inferenceOptions) ?? DEFAULT_AGE_GROUP;
   const gender = ageGroup === 'kids' ? DEFAULT_KIDS_GENDER : genderInference;
@@ -769,7 +818,7 @@ function mapFeedProductToGoogleProduct(
     : undefined;
 
   const baseProduct = {
-    itemGroupId: product.code || product.id,
+    itemGroupId: itemGroupId ?? baseOfferId,
     title: product.name?.trim() || baseOfferId,
     description: sanitizedDescription,
     link: productLink,
@@ -790,32 +839,28 @@ function mapFeedProductToGoogleProduct(
     mpn: product.code,
     googleProductCategory: options.defaultGpc,
     customLabel0: product.type_id ? String(product.type_id) : undefined,
-    color: buildColorAttribute(colors),
     gender,
     ageGroup,
     productTypes: productTypes.length ? productTypes : undefined,
   };
 
-  if (!sizes.length) {
-    return [
-      {
+  const variants: SchemaProduct[] = [];
+  for (const colorValue of colorValues) {
+    for (const sizeValue of sizeValues) {
+      const variant: SchemaProduct = {
         ...baseProduct,
-        offerId: baseOfferId,
-      },
-    ];
+        offerId: buildVariantOfferId(baseOfferId, colorValue) + (sizeValue ? `-${sizeValue.toLowerCase()}` : ''),
+        itemGroupId: baseProduct.itemGroupId ?? baseOfferId,
+        color: colorValue,
+        sizes: sizeValue ? [sizeValue] : undefined,
+      };
+      variant.gender = gender;
+      variant.ageGroup = ageGroup;
+      variants.push(variant);
+    }
   }
 
-  return sizes.map((size) => {
-    const variant: SchemaProduct = {
-      ...baseProduct,
-      offerId: buildVariantOfferId(baseOfferId, size),
-      itemGroupId: baseProduct.itemGroupId ?? baseOfferId,
-      sizes: [size],
-    };
-    variant.gender = gender;
-    variant.ageGroup = ageGroup;
-    return variant;
-  });
+  return variants.length ? variants : [{ ...baseProduct, offerId: baseOfferId }];
 }
 
 async function createContentClient() {
@@ -848,7 +893,12 @@ async function uploadProducts(
     failed: 0,
   };
 
-  for (const { product, hash } of items) {
+  for (let index = 0; index < items.length; index += 1) {
+    const { product, hash } = items[index];
+    const displayColor = product.color ?? 'n/a';
+    const displaySize = product.sizes?.[0] ?? 'n/a';
+    const variantLabel = `color: ${displayColor}, size: ${displaySize}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'}`;
+
     if (!product.offerId) {
       console.warn('Skipping product with missing offerId.');
       report.failed += 1;
@@ -856,7 +906,7 @@ async function uploadProducts(
     }
 
     if (dryRun) {
-      console.log(`[dry-run] Would upload product ${product.offerId} (size: ${product.sizes?.[0] ?? 'n/a'}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'})`);
+      console.log(`[dry-run] (${index + 1}/${items.length}) Would upload product ${product.offerId} (${variantLabel})`);
       report.success += 1;
       continue;
     }
@@ -866,7 +916,7 @@ async function uploadProducts(
         merchantId,
         requestBody: product,
       });
-      console.log(`Uploaded product ${product.offerId} (size: ${product.sizes?.[0] ?? 'n/a'}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'})`);
+      console.log(`Uploaded product ${product.offerId} (${index + 1}/${items.length}) (${variantLabel})`);
       report.success += 1;
       upsertVariantRecord(db, {
         offerId: product.offerId,
