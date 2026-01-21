@@ -503,7 +503,7 @@ async function loadInlineCredentialsFromEnv(): Promise<JWTInput | undefined> {
   }
 }
 
-const EXCLUDED_SIZE_TOKENS = new Set(['3XL', '4XL', '5XL']);
+const EXCLUDED_SIZE_TOKENS = new Set(['3XL', '4XL', '5XL', '6XL']);
 
 function shouldExcludeSize(input: string): boolean {
   const trimmed = input.trim().toUpperCase();
@@ -604,46 +604,112 @@ const AGE_KEYWORDS: Record<Exclude<AgeGroupValue, 'adult'>, string[]> = {
   kids: ['youth', 'kid', 'kids', 'child', 'children', 'teen', 'junior', 'boys', 'girls'],
 };
 
+interface ColorKeyword {
+  value: string;
+  label: string;
+}
+
+const NEUTRAL_COLOR_KEYWORDS: ColorKeyword[] = [
+  { value: 'black', label: 'Black' },
+  { value: 'white', label: 'White' },
+  { value: 'grey', label: 'Grey' },
+  { value: 'gray', label: 'Grey' },
+];
+const BLUE_COLOR_KEYWORDS: ColorKeyword[] = [
+  { value: 'navy', label: 'Navy' },
+  { value: 'blue', label: 'Blue' },
+  { value: 'royal', label: 'Royal' },
+];
+
+function matchColorKeyword(
+  rawValue: string,
+  normalizedValue: string,
+  keywords: ColorKeyword[],
+): string | undefined {
+  for (const keyword of keywords) {
+    if (normalizedValue === keyword.value) {
+      return keyword.label;
+    }
+  }
+  for (const keyword of keywords) {
+    if (normalizedValue.includes(keyword.value)) {
+      return keyword.label;
+    }
+  }
+  return undefined;
+}
+
+function collectColorMatches(
+  colors: string[],
+  keywords: ColorKeyword[],
+  limit = 3,
+): Set<string> {
+  const matches = new Set<string>();
+  for (const keyword of keywords) {
+    if (matches.size >= limit) break;
+
+    let exactMatch: string | undefined;
+    let fuzzyMatch: string | undefined;
+
+    for (const raw of colors) {
+      const normalized = raw.trim().toLowerCase();
+      if (!normalized) continue;
+      if (normalized === keyword.value) {
+        exactMatch = keyword.label;
+        break;
+      }
+      if (!fuzzyMatch && normalized.includes(keyword.value)) {
+        fuzzyMatch = keyword.label;
+      }
+    }
+
+    if (exactMatch) {
+      matches.add(exactMatch);
+    } else if (fuzzyMatch) {
+      matches.add(fuzzyMatch);
+    }
+  }
+  return matches;
+}
+
 function buildColorGroups(colors: string[]): string[] {
   if (!colors.length) return [];
 
-  const neutralSet = new Set<string>();
-  const blueSet = new Set<string>();
-  let hasOther = false;
-
+  const neutralSet = collectColorMatches(colors, NEUTRAL_COLOR_KEYWORDS);
+  const blueSet = collectColorMatches(colors, BLUE_COLOR_KEYWORDS);
+  const normalizeColor = (value: string) => {
+    const trimmed = value.trim().toLowerCase();
+    return trimmed || undefined;
+  };
+  const totalColors = new Set<string>();
+  const matchedColors = new Set<string>();
   for (const raw of colors) {
-    const value = raw.toLowerCase();
-
-    const matchedNeutral = ['black', 'white', 'grey', 'gray'].some((keyword) => {
-      if (value.includes(keyword)) {
-        if (keyword === 'white') neutralSet.add('White');
-        else if (keyword === 'black') neutralSet.add('Black');
-        else neutralSet.add('Grey');
-        return true;
-      }
-      return false;
-    });
-    const matchedBlue = ['navy', 'blue', 'royal'].some((keyword) => {
-      if (value.includes(keyword)) {
-        if (keyword === 'navy') blueSet.add('Navy');
-        else if (keyword === 'royal') blueSet.add('Royal');
-        else blueSet.add('Blue');
-        return true;
-      }
-      return false;
-    });
-
-    if (!matchedNeutral && !matchedBlue) {
-      hasOther = true;
+    const normalized = normalizeColor(raw);
+    if (normalized) {
+      totalColors.add(normalized);
     }
   }
+  neutralSet.forEach((color) => {
+    const normalized = normalizeColor(color);
+    if (normalized) matchedColors.add(normalized);
+  });
+  blueSet.forEach((color) => {
+    const normalized = normalizeColor(color);
+    if (normalized) matchedColors.add(normalized);
+  });
+  const hasOther = totalColors.size > matchedColors.size;
 
   const groups: string[] = [];
-  if (neutralSet.size) {
-    groups.push(Array.from(neutralSet).join('/'));
-  }
-  if (blueSet.size) {
-    groups.push(Array.from(blueSet).join('/'));
+  const totalPrimaryColors = neutralSet.size + blueSet.size;
+  if (neutralSet.size && blueSet.size && totalPrimaryColors <= 3) {
+    groups.push([...neutralSet, ...blueSet].join('/'));
+  } else {
+    if (neutralSet.size) {
+      groups.push(Array.from(neutralSet).join('/'));
+    }
+    if (blueSet.size) {
+      groups.push(Array.from(blueSet).join('/'));
+    }
   }
   if (hasOther) {
     groups.push('Multicolor');
