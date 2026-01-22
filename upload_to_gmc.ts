@@ -518,7 +518,7 @@ async function deleteStaleProducts(
       deleteVariantRecords(db, [offerId]);
       console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
     } catch (error) {
-      console.error(`Failed to delete product ${restId}:`, error);
+      logApiError(`Failed to delete product ${restId}`, error);
     }
   }
 }
@@ -595,31 +595,6 @@ function extractProductSizes(product: FeedProduct): {
   };
 }
 
-function extractProductColors(product: FeedProduct): string[] {
-  const colorEntries = toArray(product.colors?.color as FeedColor | FeedColor[] | undefined);
-  const normalizedColors: string[] = [];
-  const seen = new Set<string>();
-
-  for (const entry of colorEntries) {
-    if (!entry) continue;
-    const colorCandidates = [
-      entry.name,
-      ...(toArray(entry.clr as FeedClr | FeedClr[] | undefined).map((clr) => clr?.name)),
-    ];
-    for (const candidate of colorCandidates) {
-      if (!candidate) continue;
-      const normalized = String(candidate).trim();
-      if (!normalized || seen.has(normalized)) {
-        continue;
-      }
-      seen.add(normalized);
-      normalizedColors.push(normalized);
-    }
-  }
-
-  return normalizedColors;
-}
-
 function getFeedColorEntries(product: FeedProduct): FeedColor[] {
   return toArray(product.colors?.color as FeedColor | FeedColor[] | undefined);
 }
@@ -667,14 +642,30 @@ function getImageCategory(entry: FeedImage): ImageCategory {
   return 'other';
 }
 
-function getColorNameTokens(entry: FeedColor): string[] {
+function buildColorLabel(entry: FeedColor): string | undefined {
   const rawNames = [
     entry.name,
     ...toArray(entry.clr as FeedClr | FeedClr[] | undefined).map((clr) => clr?.name),
   ];
-  return rawNames
-    .filter((name): name is string => Boolean(name))
-    .map((name) => name.toLowerCase());
+  const names = rawNames
+    .map((name) => (name ? String(name).trim() : ''))
+    .filter((name) => Boolean(name));
+  if (!names.length) {
+    const fallback = entry.color_id ?? entry.id;
+    return fallback ? String(fallback) : undefined;
+  }
+  const uniqueNames = Array.from(new Set(names));
+  const label = uniqueNames.join('/');
+  return label.length <= COLOR_ATTRIBUTE_MAX_LENGTH ? label : label.slice(0, COLOR_ATTRIBUTE_MAX_LENGTH);
+}
+
+function getColorNameTokens(entry: FeedColor): string[] {
+  return [
+    entry.name,
+    ...toArray(entry.clr as FeedClr | FeedClr[] | undefined).map((clr) => clr?.name),
+  ]
+    .map((name) => (name ? String(name).trim().toLowerCase() : ''))
+    .filter(Boolean);
 }
 
 function getDefaultColorEntry(product: FeedProduct): FeedColor | undefined {
@@ -740,46 +731,6 @@ function resolveColorEntriesForLabel(
   return result.length ? result : [entries[0]];
 }
 
-function buildVariantOfferId(baseOfferId: string, color?: string): string {
-  const normalize = (value: string) => value
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '');
-  const suffix = color ? normalize(color) : 'variant';
-  return `${baseOfferId}-${suffix}`;
-}
-
-function buildTokenSet(sources: Array<string | undefined>): Set<string> {
-  const normalized = sources
-    .map((part) => part?.toLowerCase() ?? '')
-    .filter(Boolean)
-    .join(' ')
-    .replace(/['’]/g, '')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-
-  if (!normalized) {
-    return new Set();
-  }
-
-  return new Set(
-    normalized
-      .split(' ')
-      .map((token) => token.trim())
-      .filter(Boolean),
-  );
-}
-
-const FEMALE_KEYWORDS = ['women', 'womens', 'woman', "woman's", 'lady', 'ladies', 'female', 'girl', 'girls', "girls'", "girl's"];
-const MALE_KEYWORDS = ['men', 'mens', 'man', "man’s", 'male', 'boy', 'boys', "boys'", "boy's", 'guy', 'guys'];
-const UNISEX_KEYWORDS = ['unisex'];
-const AGE_KEYWORDS: Record<Exclude<AgeGroupValue, 'adult'>, string[]> = {
-  newborn: ['newborn', 'new-born'],
-  infant: ['infant', 'baby', 'layette'],
-  toddler: ['toddler'],
-  kids: ['youth', 'kid', 'kids', 'child', 'children', 'teen', 'junior', 'boys', 'girls'],
-};
-
 interface ColorKeyword {
   value: string;
   label: string;
@@ -798,7 +749,6 @@ const BLUE_COLOR_KEYWORDS: ColorKeyword[] = [
 ];
 
 function matchColorKeyword(
-  rawValue: string,
   normalizedValue: string,
   keywords: ColorKeyword[],
 ): string | undefined {
@@ -893,6 +843,59 @@ function buildColorGroups(colors: string[]): string[] {
 
   return groups;
 }
+
+const MAX_OFFER_ID_LENGTH = 50;
+
+function buildVariantOfferId(baseOfferId: string, color?: string, size?: string): string {
+  const normalize = (value: string) => value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+
+  const sizeSegment = size ? `-${size.toLowerCase()}` : '';
+  const availableForColor = Math.max(
+    MAX_OFFER_ID_LENGTH - baseOfferId.length - sizeSegment.length - 1,
+    1,
+  );
+
+  let colorSlug = color ? normalize(color) : 'variant';
+  if (colorSlug.length > availableForColor) {
+    colorSlug = colorSlug.slice(0, availableForColor);
+  }
+
+  return `${baseOfferId}-${colorSlug}${sizeSegment}`;
+}
+
+function buildTokenSet(sources: Array<string | undefined>): Set<string> {
+  const normalized = sources
+    .map((part) => part?.toLowerCase() ?? '')
+    .filter(Boolean)
+    .join(' ')
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+
+  if (!normalized) {
+    return new Set();
+  }
+
+  return new Set(
+    normalized
+      .split(' ')
+      .map((token) => token.trim())
+      .filter(Boolean),
+  );
+}
+
+const FEMALE_KEYWORDS = ['women', 'womens', 'woman', "woman's", 'lady', 'ladies', 'female', 'girl', 'girls', "girls'", "girl's"];
+const MALE_KEYWORDS = ['men', 'mens', 'man', "man’s", 'male', 'boy', 'boys', "boys'", "boy's", 'guy', 'guys'];
+const UNISEX_KEYWORDS = ['unisex'];
+const AGE_KEYWORDS: Record<Exclude<AgeGroupValue, 'adult'>, string[]> = {
+  newborn: ['newborn', 'new-born'],
+  infant: ['infant', 'baby', 'layette'],
+  toddler: ['toddler'],
+  kids: ['youth', 'kid', 'kids', 'child', 'children', 'teen', 'junior', 'boys', 'girls'],
+};
 
 function inferGenderFromProduct(
   product: FeedProduct,
@@ -1138,12 +1141,24 @@ function mapFeedProductToGoogleProduct(
   if (hadSizeEntries && !sizes.length) {
     return [];
   }
-  const colors = extractProductColors(product);
   const feedColorEntries = getFeedColorEntries(product);
   const productTypes = extractProductCategories(product, categoryMap);
-  const colorGroups = buildColorGroups(colors);
   const sizeValues = sizes.length ? sizes : [undefined];
-  const colorValues = colorGroups.length ? colorGroups : [undefined];
+  let colorVariants: Array<{ label: string | undefined, entries: FeedColor[] }>;
+  if (!feedColorEntries.length) {
+    colorVariants = [{ label: undefined, entries: [] }];
+  } else if (feedColorEntries.length <= 5) {
+    colorVariants = feedColorEntries.map((entry) => ({
+      label: buildColorLabel(entry),
+      entries: [entry],
+    }));
+  } else {
+    const groupLabels = buildColorGroups(feedColorEntries.map((entry) => buildColorLabel(entry) ?? 'Multicolor'));
+    colorVariants = groupLabels.map((label) => ({
+      label,
+      entries: resolveColorEntriesForLabel(label, product, feedColorEntries),
+    }));
+  }
   const genderInference = inferGenderFromProduct(product, productTypes, inferenceOptions) ?? DEFAULT_GENDER;
   const ageGroup = inferAgeGroupFromProduct(product, productTypes, inferenceOptions) ?? DEFAULT_AGE_GROUP;
   const gender = ageGroup === 'kids' ? DEFAULT_KIDS_GENDER : genderInference;
@@ -1177,9 +1192,8 @@ function mapFeedProductToGoogleProduct(
   };
 
   const variants: SchemaProduct[] = [];
-  for (const colorValue of colorValues) {
+  for (const { label: colorValue, entries: colorEntries } of colorVariants) {
     for (const sizeValue of sizeValues) {
-      const colorEntries = resolveColorEntriesForLabel(colorValue, product, feedColorEntries);
       const sizeEntry = sizeValue ? sizeSourceMap.get(sizeValue.toLowerCase()) : undefined;
       const variantImageLinks = buildVariantImageLinks(
         imageEntries,
@@ -1194,7 +1208,7 @@ function mapFeedProductToGoogleProduct(
 
       const variant: SchemaProduct = {
         ...baseProduct,
-        offerId: buildVariantOfferId(baseOfferId, colorValue) + (sizeValue ? `-${sizeValue.toLowerCase()}` : ''),
+        offerId: buildVariantOfferId(baseOfferId, colorValue, sizeValue),
         itemGroupId: baseProduct.itemGroupId ?? baseOfferId,
         color: colorValue,
         sizes: sizeValue ? [sizeValue] : undefined,
@@ -1278,7 +1292,7 @@ async function uploadProducts(
         updatedAt: Date.now(),
       });
     } catch (error) {
-      console.error(`Failed to upload product ${product.offerId}:`, error);
+      logApiError(`Failed to upload product ${product.offerId}`, error);
       report.failed += 1;
     }
 
@@ -1386,3 +1400,17 @@ main().catch((error) => {
   console.error('Fatal error while syncing Google Merchant Center products:', error);
   process.exit(1);
 });
+function logApiError(context: string, error: unknown) {
+  if (error && typeof error === 'object' && 'errors' in (error as Record<string, unknown>)) {
+    const errObj = error as {
+      errors?: Array<{ reason?: string; message?: string; domain?: string }>;
+      message?: string;
+    };
+    const primary = errObj.errors && errObj.errors[0];
+    const reason = primary?.reason ?? 'unknown_reason';
+    const message = primary?.message ?? errObj.message ?? String(error);
+    console.error(`[error] ${context} | reason=${reason} | message=${message}`);
+  } else {
+    console.error(`[error] ${context}`, error);
+  }
+}
