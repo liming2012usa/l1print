@@ -63,6 +63,9 @@ interface FeedProduct {
   colors?: {
     color?: FeedColor | FeedColor[];
   };
+  views?: {
+    view?: FeedView | FeedView[];
+  };
   categories?: {
     category?: FeedProductCategory | FeedProductCategory[];
   };
@@ -94,6 +97,13 @@ interface FeedClr {
   name?: string;
   html?: string;
 }
+
+interface FeedView {
+  name?: string;
+  image_url?: string;
+}
+
+type ImageCategory = 'front' | 'back' | 'other';
 
 interface FeedProductCategory {
   id?: string;
@@ -128,6 +138,8 @@ const DEFAULT_XML_PATH = path.resolve(__dirname, 'data_feeds', 'products.xml');
 const DEFAULT_META_PATH = path.resolve(__dirname, 'data_feeds', 'meta_data.xml');
 const DB_PATH = path.resolve(__dirname, '.cache', 'gmc-sync.db');
 const COLOR_ATTRIBUTE_MAX_LENGTH = 100;
+const MAX_VARIANT_IMAGE_COUNT = 11;
+const PREFERRED_IMAGE_SIZE_ID = '13';
 const DEFAULT_GENDER: GenderValue = 'male';
 const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
@@ -550,10 +562,15 @@ function shouldExcludeSize(input: string): boolean {
   return EXCLUDED_SIZE_TOKENS.has(trimmed);
 }
 
-function extractProductSizes(product: FeedProduct): { values: string[], hadInput: boolean } {
+function extractProductSizes(product: FeedProduct): {
+  values: string[],
+  hadInput: boolean,
+  sourceMap: Map<string, FeedSize>,
+} {
   const sizeEntries = toArray(product.sizes?.size as FeedSize | FeedSize[] | undefined);
   const normalizedSizes: string[] = [];
   const seen = new Set<string>();
+  const sourceMap = new Map<string, FeedSize>();
 
   for (const entry of sizeEntries) {
     if (!entry) continue;
@@ -568,11 +585,13 @@ function extractProductSizes(product: FeedProduct): { values: string[], hadInput
     }
     seen.add(normalized);
     normalizedSizes.push(normalized);
+    sourceMap.set(normalized.toLowerCase(), entry);
   }
 
   return {
     values: normalizedSizes,
     hadInput: sizeEntries.length > 0,
+    sourceMap,
   };
 }
 
@@ -599,6 +618,126 @@ function extractProductColors(product: FeedProduct): string[] {
   }
 
   return normalizedColors;
+}
+
+function getFeedColorEntries(product: FeedProduct): FeedColor[] {
+  return toArray(product.colors?.color as FeedColor | FeedColor[] | undefined);
+}
+
+function extractViewImageEntries(product: FeedProduct): FeedImage[] {
+  const views = toArray(product.views?.view as FeedView | FeedView[] | undefined);
+  if (!views.length) {
+    return [];
+  }
+  const priorityNames = [
+    'front',
+    'back',
+    'right sleeve',
+    'right sleeve (short)',
+    'right sleeve (long)',
+    'left sleeve',
+    'left sleeve (short)',
+    'left sleeve (long)',
+  ];
+  const priorityMap = new Map<string, number>();
+  priorityNames.forEach((name, index) => priorityMap.set(name, index));
+  return views
+    .map((view, index) => {
+      const normalizedName = (view.name ?? '').toLowerCase();
+      const priority = priorityMap.get(normalizedName) ?? (priorityNames.length + index);
+      return {
+        type: view.name ? `view:${view.name}` : 'view',
+        src: view.image_url,
+        order: priority,
+      };
+    })
+    .filter((entry) => Boolean(entry.src))
+    .sort((a, b) => a.order - b.order)
+    .map(({ type, src }) => ({ type, src }));
+}
+
+function getImageCategory(entry: FeedImage): ImageCategory {
+  const type = (entry.type ?? '').toLowerCase();
+  if (type.includes('front')) {
+    return 'front';
+  }
+  if (type.includes('back')) {
+    return 'back';
+  }
+  return 'other';
+}
+
+function getColorNameTokens(entry: FeedColor): string[] {
+  const rawNames = [
+    entry.name,
+    ...toArray(entry.clr as FeedClr | FeedClr[] | undefined).map((clr) => clr?.name),
+  ];
+  return rawNames
+    .filter((name): name is string => Boolean(name))
+    .map((name) => name.toLowerCase());
+}
+
+function getDefaultColorEntry(product: FeedProduct): FeedColor | undefined {
+  const entries = getFeedColorEntries(product);
+  if (!entries.length) {
+    return undefined;
+  }
+  if (product.default_color_id) {
+    const defaultId = String(product.default_color_id);
+    const match = entries.find((entry) =>
+      String(entry.id) === defaultId || String(entry.color_id) === defaultId,
+    );
+    if (match) {
+      return match;
+    }
+  }
+  return entries[0];
+}
+
+function resolveColorEntriesForLabel(
+  label: string | undefined,
+  product: FeedProduct,
+  entries: FeedColor[],
+): FeedColor[] {
+  if (!entries.length) {
+    return [];
+  }
+  if (!label) {
+    const defaultEntry = getDefaultColorEntry(product);
+    return defaultEntry ? [defaultEntry] : [entries[0]];
+  }
+  if (label === 'Multicolor') {
+    return entries;
+  }
+  const tokens = label
+    .split('/')
+    .map((token) => token.trim().toLowerCase())
+    .filter(Boolean);
+  if (!tokens.length) {
+    const defaultEntry = getDefaultColorEntry(product);
+    return defaultEntry ? [defaultEntry] : [entries[0]];
+  }
+  const result: FeedColor[] = [];
+  const used = new Set<FeedColor>();
+  for (const token of tokens) {
+    const match = entries.find((entry) => {
+      if (used.has(entry)) return false;
+      return getColorNameTokens(entry).some((name) =>
+        name.includes(token) || token.includes(name),
+      );
+    });
+    if (match) {
+      used.add(match);
+      result.push(match);
+    }
+  }
+  if (!result.length) {
+    const defaultEntry = getDefaultColorEntry(product);
+    if (defaultEntry) {
+      result.push(defaultEntry);
+    }
+  }
+  return result.length ? result : [entries[0]];
 }
 
 function buildVariantOfferId(baseOfferId: string, color?: string): string {
@@ -839,6 +978,10 @@ function getDefaultSize(product: FeedProduct): FeedSize | undefined {
   return selected || sizes[0];
 }
 
+function getPreferredImageSizeEntry(): FeedSize {
+  return { id: PREFERRED_IMAGE_SIZE_ID };
+}
+
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -857,24 +1000,102 @@ function replacePlaceholder(
     .replace(encodedRegex, encodeURIComponent(value));
 }
 
-function materializeImageSource(src: string | undefined, product: FeedProduct): string | undefined {
+function materializeImageSource(
+  src: string | undefined,
+  product: FeedProduct,
+  color?: FeedColor,
+  size?: FeedSize,
+): string | undefined {
   if (!src) return undefined;
   const defaultColorId = getDefaultColorId(product);
   const defaultSize = getDefaultSize(product);
+  const colorId = color?.color_id || color?.id || defaultColorId;
+  const sizeEntry = size ?? defaultSize;
   let result = src;
 
-  if (defaultColorId) {
-    result = replacePlaceholder(result, 'COLOR_ID', defaultColorId);
+  if (colorId) {
+    result = replacePlaceholder(result, 'COLOR_ID', String(colorId));
   }
-  if (defaultSize?.id) {
-    result = replacePlaceholder(result, 'SIZE_ID', String(defaultSize.id));
+  if (sizeEntry?.id) {
+    result = replacePlaceholder(result, 'SIZE_ID', String(sizeEntry.id));
   }
-  const sizeToken = defaultSize?.value || defaultSize?.name || defaultSize?.size_label_1;
+  const sizeToken = sizeEntry?.id || sizeEntry?.value || sizeEntry?.name || sizeEntry?.size_label_1;
   if (sizeToken) {
     result = replacePlaceholder(result, 'SIZE', sizeToken);
   }
 
   return result;
+}
+
+function buildVariantImageLinks(
+  imageEntries: FeedImage[],
+  product: FeedProduct,
+  colorEntries: FeedColor[],
+  sizeEntry: FeedSize | undefined,
+  assetBaseUrl: string,
+): string[] {
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  const colorsToApply = colorEntries.length ? colorEntries : [undefined];
+  const preferredImageSize = getPreferredImageSizeEntry();
+  const effectiveSizeEntry = preferredImageSize ?? sizeEntry;
+
+  const tryAddImage = (entry: FeedImage, colorEntry: FeedColor | undefined) => {
+    const materialized = materializeImageSource(entry?.src, product, colorEntry, effectiveSizeEntry);
+    const absolute = ensureAbsoluteUrl(assetBaseUrl, materialized);
+    if (absolute && !seen.has(absolute)) {
+      seen.add(absolute);
+      urls.push(absolute);
+      return true;
+    }
+    return false;
+  };
+
+  const addImagesForCategory = (
+    category: ImageCategory,
+    predicate: (entry: FeedImage) => boolean,
+  ) => {
+    for (const entry of imageEntries) {
+      if (!predicate(entry)) continue;
+      for (const colorEntry of colorsToApply) {
+        if (tryAddImage(entry, colorEntry) && urls.length >= MAX_VARIANT_IMAGE_COUNT) {
+          return;
+        }
+      }
+      if (urls.length >= MAX_VARIANT_IMAGE_COUNT) {
+        return;
+      }
+    }
+  };
+
+  const imagesByCategory = {
+    'front': (entry: FeedImage) => getImageCategory(entry) === 'front',
+    'back': (entry: FeedImage) => getImageCategory(entry) === 'back',
+    'other': (entry: FeedImage) => getImageCategory(entry) === 'other',
+  } as const;
+
+  addImagesForCategory('front', imagesByCategory.front);
+  if (urls.length < MAX_VARIANT_IMAGE_COUNT) {
+    addImagesForCategory('back', imagesByCategory.back);
+  }
+  if (urls.length < MAX_VARIANT_IMAGE_COUNT) {
+    addImagesForCategory('other', imagesByCategory.other);
+  }
+
+  if (urls.length < MAX_VARIANT_IMAGE_COUNT) {
+    for (const entry of imageEntries) {
+      for (const colorEntry of colorsToApply) {
+        if (tryAddImage(entry, colorEntry) && urls.length >= MAX_VARIANT_IMAGE_COUNT) {
+          return urls;
+        }
+      }
+      if (urls.length >= MAX_VARIANT_IMAGE_COUNT) {
+        break;
+      }
+    }
+  }
+
+  return urls;
 }
 
 function mapFeedProductToGoogleProduct(
@@ -888,12 +1109,17 @@ function mapFeedProductToGoogleProduct(
   const templatePath = applyTemplate(options.productPathTemplate, product);
   const productLink = ensureAbsoluteUrl(options.baseStoreUrl, templatePath) ?? options.baseStoreUrl;
 
-  const imageEntries = toArray(product.images?.image);
-  const imageLinks = imageEntries
-    .map((entry) => materializeImageSource(entry?.src, product))
-    .map((entry) => ensureAbsoluteUrl(options.assetBaseUrl, entry))
-    .filter((url): url is string => Boolean(url));
-  const [primaryImage, ...additionalImages] = imageLinks;
+  const baseImageEntries = toArray(product.images?.image as FeedImage | FeedImage[] | undefined);
+  const viewImageEntries = extractViewImageEntries(product);
+  const imageEntries = [...viewImageEntries, ...baseImageEntries];
+  const defaultImageLinks = buildVariantImageLinks(
+    imageEntries,
+    product,
+    [],
+    undefined,
+    options.assetBaseUrl,
+  );
+  const [fallbackPrimaryImage, ...fallbackAdditionalImages] = defaultImageLinks;
 
   const sanitizedDescription = sanitizeDescription(product.description || String(product.name || ''));
   const productIdPart = product.id ? String(product.id) : undefined;
@@ -904,11 +1130,16 @@ function mapFeedProductToGoogleProduct(
   const itemGroupId = codePart && productIdPart
     ? `${codePart}-${productIdPart}`
     : (codePart ?? productIdPart);
-  const { values: sizes, hadInput: hadSizeEntries } = extractProductSizes(product);
+  const {
+    values: sizes,
+    hadInput: hadSizeEntries,
+    sourceMap: sizeSourceMap,
+  } = extractProductSizes(product);
   if (hadSizeEntries && !sizes.length) {
     return [];
   }
   const colors = extractProductColors(product);
+  const feedColorEntries = getFeedColorEntries(product);
   const productTypes = extractProductCategories(product, categoryMap);
   const colorGroups = buildColorGroups(colors);
   const sizeValues = sizes.length ? sizes : [undefined];
@@ -925,8 +1156,6 @@ function mapFeedProductToGoogleProduct(
     title: product.name?.trim() || baseOfferId,
     description: sanitizedDescription,
     link: productLink,
-    imageLink: primaryImage,
-    additionalImageLinks: additionalImages.length ? additionalImages : undefined,
     contentLanguage: options.contentLanguage,
     targetCountry: options.targetCountry,
     channel: options.channel,
@@ -950,12 +1179,29 @@ function mapFeedProductToGoogleProduct(
   const variants: SchemaProduct[] = [];
   for (const colorValue of colorValues) {
     for (const sizeValue of sizeValues) {
+      const colorEntries = resolveColorEntriesForLabel(colorValue, product, feedColorEntries);
+      const sizeEntry = sizeValue ? sizeSourceMap.get(sizeValue.toLowerCase()) : undefined;
+      const variantImageLinks = buildVariantImageLinks(
+        imageEntries,
+        product,
+        colorEntries,
+        sizeEntry,
+        options.assetBaseUrl,
+      );
+      const [variantPrimaryImage, ...variantAdditionalImages] = variantImageLinks.length
+        ? variantImageLinks
+        : defaultImageLinks;
+
       const variant: SchemaProduct = {
         ...baseProduct,
         offerId: buildVariantOfferId(baseOfferId, colorValue) + (sizeValue ? `-${sizeValue.toLowerCase()}` : ''),
         itemGroupId: baseProduct.itemGroupId ?? baseOfferId,
         color: colorValue,
         sizes: sizeValue ? [sizeValue] : undefined,
+        imageLink: variantPrimaryImage ?? fallbackPrimaryImage,
+        additionalImageLinks: variantAdditionalImages.length
+          ? variantAdditionalImages
+          : (fallbackAdditionalImages.length ? fallbackAdditionalImages : undefined),
       };
       variant.gender = gender;
       variant.ageGroup = ageGroup;
@@ -1045,6 +1291,11 @@ async function uploadProducts(
 }
 
 async function main() {
+  const startTime = Date.now();
+  const formatTimestamp = (timestamp: number) =>
+    new Date(timestamp).toLocaleString('en-US', { timeZone: 'America/New_York' });
+  console.log(`[run] Started at ${formatTimestamp(startTime)} (EST)`);
+
   const cliOptions = parseCliArgs(process.argv.slice(2));
   const merchantId = getEnvVar('GOOGLE_MERCHANT_ID');
   const storeBaseUrl = getEnvVar('STORE_BASE_URL', 'https://l1print.com/');
@@ -1125,6 +1376,10 @@ async function main() {
   }
 
   await uploadProducts(uploadQueue, merchantId, contentApi, db, cliOptions.dryRun);
+
+  const endTime = Date.now();
+  const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
+  console.log(`[run] Finished at ${formatTimestamp(endTime)} (EST, duration: ${durationSeconds}s)`);
 }
 
 main().catch((error) => {
