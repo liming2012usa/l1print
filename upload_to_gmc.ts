@@ -144,6 +144,13 @@ const DEFAULT_GENDER: GenderValue = 'male';
 const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
 
+const COLOR_RED = '\x1b[31m';
+const COLOR_RESET = '\x1b[0m';
+
+function colorizeRed(message: string): string {
+  return `${COLOR_RED}${message}${COLOR_RESET}`;
+}
+
 const FORCE_EXIT_ARM_DELAY_MS = 500;
 let stopRequested = false;
 let forceExitArmed = false;
@@ -519,6 +526,11 @@ async function deleteStaleProducts(
       console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
     } catch (error) {
       logApiError(`Failed to delete product ${restId}`, error);
+      if (isNetworkError(error)) {
+        stopRequested = true;
+        console.error(colorizeRed('Network issue detected. Halting delete operation to avoid repeated failures.'));
+        break;
+      }
     }
   }
 }
@@ -1293,6 +1305,11 @@ async function uploadProducts(
       });
     } catch (error) {
       logApiError(`Failed to upload product ${product.offerId}`, error);
+      if (isNetworkError(error)) {
+        stopRequested = true;
+        console.error(colorizeRed('Network issue detected. Halting upload operation to avoid repeated failures.'));
+        break;
+      }
       report.failed += 1;
     }
 
@@ -1359,11 +1376,19 @@ async function main() {
   const db = await getDatabase();
   const cachedVariants = loadCachedVariants(db);
   const seenOfferIds = new Set<string>();
+  const duplicateOfferIds = new Set<string>();
   const uploadQueue: UploadQueueItem[] = [];
 
   for (const product of googleProducts) {
     if (!product.offerId) continue;
-    seenOfferIds.add(product.offerId);
+    if (seenOfferIds.has(product.offerId)) {
+      if (!duplicateOfferIds.has(product.offerId)) {
+        duplicateOfferIds.add(product.offerId);
+        logDuplicateOfferId(product);
+      }
+    } else {
+      seenOfferIds.add(product.offerId);
+    }
     const hash = hashProduct(product);
     const cached = cachedVariants.get(product.offerId);
     if (cached && cached.hash === hash) {
@@ -1409,8 +1434,41 @@ function logApiError(context: string, error: unknown) {
     const primary = errObj.errors && errObj.errors[0];
     const reason = primary?.reason ?? 'unknown_reason';
     const message = primary?.message ?? errObj.message ?? String(error);
-    console.error(`[error] ${context} | reason=${reason} | message=${message}`);
+    console.error(colorizeRed(`[error] ${context} | reason=${reason} | message=${message}`));
   } else {
-    console.error(`[error] ${context}`, error);
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(colorizeRed(`[error] ${context} | message=${message}`));
   }
+}
+
+function logDuplicateOfferId(product: SchemaProduct) {
+  const color = product.color ?? 'n/a';
+  const size = product.sizes?.[0] ?? 'n/a';
+  const title = product.title ?? 'n/a';
+  const itemGroupId = product.itemGroupId ?? 'n/a';
+  console.error(
+    colorizeRed(
+      `[dup] offerId=${product.offerId} | itemGroupId=${itemGroupId} | color=${color} | size=${size} | title=${title}`,
+    ),
+  );
+}
+
+const NETWORK_ERROR_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT']);
+
+function isNetworkError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false;
+  }
+  const candidate = error as Record<string, unknown>;
+  const code = candidate.code ? String(candidate.code) : '';
+  if (NETWORK_ERROR_CODES.has(code)) {
+    return true;
+  }
+  const message = candidate.message ? String(candidate.message).toLowerCase() : '';
+  return Boolean(message && (
+    message.includes('getaddrinfo') ||
+    message.includes('socket hang up') ||
+    message.includes('network') ||
+    message.includes('fetch failed')
+  ));
 }
