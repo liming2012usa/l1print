@@ -140,6 +140,9 @@ const DB_PATH = path.resolve(__dirname, '.cache', 'gmc-sync.db');
 const COLOR_ATTRIBUTE_MAX_LENGTH = 100;
 const MAX_VARIANT_IMAGE_COUNT = 11;
 const PREFERRED_IMAGE_SIZE_ID = '13';
+const API_REQUEST_TIMEOUT_MS = 60_000;
+const RETRY_BASE_DELAY_MS = 10_000;
+const RETRY_MAX_DELAY_MS = 120_000;
 const DEFAULT_GENDER: GenderValue = 'male';
 const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
@@ -149,6 +152,31 @@ const COLOR_RESET = '\x1b[0m';
 
 function colorizeRed(message: string): string {
   return `${COLOR_RED}${message}${COLOR_RESET}`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeoutId: NodeJS.Timeout | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      const error = new Error(`Request timed out after ${timeoutMs}ms (${label})`);
+      (error as NodeJS.ErrnoException).code = 'ETIMEDOUT';
+      reject(error);
+    }, timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
+function getRetryDelayMs(attempt: number): number {
+  const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+  return Math.min(delay, RETRY_MAX_DELAY_MS);
 }
 
 const FORCE_EXIT_ARM_DELAY_MS = 500;
@@ -517,19 +545,35 @@ async function deleteStaleProducts(
       continue;
     }
 
-    try {
-      await contentApi.products.delete({
-        merchantId,
-        productId: restId,
-      });
-      deleteVariantRecords(db, [offerId]);
-      console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
-    } catch (error) {
-      logApiError(`Failed to delete product ${restId}`, error);
-      if (isNetworkError(error)) {
-        stopRequested = true;
-        console.error(colorizeRed('Network issue detected. Halting delete operation to avoid repeated failures.'));
+    let attempt = 0;
+    while (true) {
+      if (isStopRequested()) {
+        console.log('Stop requested. Halting product deletion loop.');
         break;
+      }
+      try {
+        await withTimeout(
+          contentApi.products.delete({
+            merchantId,
+            productId: restId,
+          }),
+          API_REQUEST_TIMEOUT_MS,
+          `delete product ${restId}`,
+        );
+        deleteVariantRecords(db, [offerId]);
+        console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
+        break;
+      } catch (error) {
+        logApiError(`Failed to delete product ${restId}`, error);
+        if (!isNetworkError(error)) {
+          break;
+        }
+        const delayMs = getRetryDelayMs(attempt);
+        attempt += 1;
+        console.error(
+          colorizeRed(`Network issue detected. Retrying delete in ${Math.round(delayMs / 1000)}s...`),
+        );
+        await sleep(delayMs);
       }
     }
   }
@@ -1290,27 +1334,43 @@ async function uploadProducts(
       continue;
     }
 
-    try {
-      await contentApi.products.insert({
-        merchantId,
-        requestBody: product,
-      });
-      console.log(`Uploaded product ${product.offerId} (${index + 1}/${items.length}) (${variantLabel})`);
-      report.success += 1;
-      upsertVariantRecord(db, {
-        offerId: product.offerId,
-        itemGroupId: product.itemGroupId ?? undefined,
-        hash,
-        updatedAt: Date.now(),
-      });
-    } catch (error) {
-      logApiError(`Failed to upload product ${product.offerId}`, error);
-      if (isNetworkError(error)) {
-        stopRequested = true;
-        console.error(colorizeRed('Network issue detected. Halting upload operation to avoid repeated failures.'));
+    let attempt = 0;
+    while (true) {
+      if (isStopRequested()) {
+        console.log('Stop requested. Halting product upload loop.');
         break;
       }
-      report.failed += 1;
+      try {
+        await withTimeout(
+          contentApi.products.insert({
+            merchantId,
+            requestBody: product,
+          }),
+          API_REQUEST_TIMEOUT_MS,
+          `upload product ${product.offerId}`,
+        );
+        console.log(`Uploaded product ${product.offerId} (${index + 1}/${items.length}) (${variantLabel})`);
+        report.success += 1;
+        upsertVariantRecord(db, {
+          offerId: product.offerId,
+          itemGroupId: product.itemGroupId ?? undefined,
+          hash,
+          updatedAt: Date.now(),
+        });
+        break;
+      } catch (error) {
+        logApiError(`Failed to upload product ${product.offerId}`, error);
+        if (!isNetworkError(error)) {
+          report.failed += 1;
+          break;
+        }
+        const delayMs = getRetryDelayMs(attempt);
+        attempt += 1;
+        console.error(
+          colorizeRed(`Network issue detected. Retrying upload in ${Math.round(delayMs / 1000)}s...`),
+        );
+        await sleep(delayMs);
+      }
     }
 
     // break;
