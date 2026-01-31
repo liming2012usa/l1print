@@ -1387,94 +1387,102 @@ async function main() {
     new Date(timestamp).toLocaleString('en-US', { timeZone: 'America/New_York' });
   console.log(`[run] Started at ${formatTimestamp(startTime)} (EST)`);
 
-  const cliOptions = parseCliArgs(process.argv.slice(2));
-  const merchantId = getEnvVar('GOOGLE_MERCHANT_ID');
-  const storeBaseUrl = getEnvVar('STORE_BASE_URL', 'https://l1print.com/');
+  let db: SqliteDatabase | null = null;
+  try {
+    const cliOptions = parseCliArgs(process.argv.slice(2));
+    const merchantId = getEnvVar('GOOGLE_MERCHANT_ID');
+    const storeBaseUrl = getEnvVar('STORE_BASE_URL', 'https://l1print.com/');
 
-  const { categories: categoryMap, manufacturers: manufacturerMap } = await loadMetaDataMaps(cliOptions.metaPath);
-  if (Object.keys(categoryMap).length) {
-    console.log(`Loaded ${Object.keys(categoryMap).length} categories from ${cliOptions.metaPath}`);
-  } else {
-    console.warn(`No categories parsed from ${cliOptions.metaPath}. Product types will use raw IDs.`);
-  }
-  if (!Object.keys(manufacturerMap).length) {
-    console.warn(`No manufacturers parsed from ${cliOptions.metaPath}. Brand names will use raw IDs.`);
-  }
-
-  const mappingOptions: MappingOptions = {
-    baseStoreUrl: storeBaseUrl,
-    assetBaseUrl: process.env.STORE_ASSET_BASE_URL ?? storeBaseUrl,
-    productPathTemplate: process.env.PRODUCT_PATH_TEMPLATE ?? '/blank_product/{id}/{nameSlug}',
-    contentLanguage: process.env.GOOGLE_CONTENT_LANGUAGE ?? 'en',
-    targetCountry: process.env.GOOGLE_TARGET_COUNTRY ?? 'US',
-    channel: (process.env.GOOGLE_CHANNEL ?? 'online') as 'online' | 'local',
-    priceCurrency: process.env.GOOGLE_PRICE_CURRENCY ?? 'USD',
-    defaultAvailability: process.env.GOOGLE_DEFAULT_AVAILABILITY ?? 'in stock',
-    defaultCondition: process.env.GOOGLE_PRODUCT_CONDITION ?? 'new',
-    defaultGpc: process.env.GOOGLE_DEFAULT_PRODUCT_CATEGORY,
-  };
-
-  console.log(`Loading feed from: ${cliOptions.xmlPath}`);
-  const feedProducts = await loadFeedProducts(cliOptions.xmlPath);
-  if (!feedProducts.length) {
-    console.warn('No products found in the feed. Proceeding to check for stale products to delete.');
-  }
-
-  const selectedProducts = typeof cliOptions.limit === 'number'
-    ? feedProducts.slice(0, cliOptions.limit)
-    : feedProducts;
-
-  const inferenceOptions: InferenceOptions = {
-    includeDescription: cliOptions.includeDescriptionInInference,
-  };
-
-  const googleProducts = selectedProducts.flatMap((item) =>
-    mapFeedProductToGoogleProduct(item, mappingOptions, categoryMap, manufacturerMap, inferenceOptions),
-  );
-  console.log(`Prepared ${googleProducts.length} variant products for evaluation.`);
-
-  const db = await getDatabase();
-  const cachedVariants = loadCachedVariants(db);
-  const seenOfferIds = new Set<string>();
-  const duplicateOfferIds = new Set<string>();
-  const uploadQueue: UploadQueueItem[] = [];
-
-  for (const product of googleProducts) {
-    if (!product.offerId) continue;
-    if (seenOfferIds.has(product.offerId)) {
-      if (!duplicateOfferIds.has(product.offerId)) {
-        duplicateOfferIds.add(product.offerId);
-        logDuplicateOfferId(product);
-      }
+    const { categories: categoryMap, manufacturers: manufacturerMap } = await loadMetaDataMaps(cliOptions.metaPath);
+    if (Object.keys(categoryMap).length) {
+      console.log(`Loaded ${Object.keys(categoryMap).length} categories from ${cliOptions.metaPath}`);
     } else {
-      seenOfferIds.add(product.offerId);
+      console.warn(`No categories parsed from ${cliOptions.metaPath}. Product types will use raw IDs.`);
     }
-    const hash = hashProduct(product);
-    const cached = cachedVariants.get(product.offerId);
-    if (cached && cached.hash === hash) {
-      continue;
+    if (!Object.keys(manufacturerMap).length) {
+      console.warn(`No manufacturers parsed from ${cliOptions.metaPath}. Brand names will use raw IDs.`);
     }
-    uploadQueue.push({ product, hash });
+
+    const mappingOptions: MappingOptions = {
+      baseStoreUrl: storeBaseUrl,
+      assetBaseUrl: process.env.STORE_ASSET_BASE_URL ?? storeBaseUrl,
+      productPathTemplate: process.env.PRODUCT_PATH_TEMPLATE ?? '/blank_product/{id}/{nameSlug}',
+      contentLanguage: process.env.GOOGLE_CONTENT_LANGUAGE ?? 'en',
+      targetCountry: process.env.GOOGLE_TARGET_COUNTRY ?? 'US',
+      channel: (process.env.GOOGLE_CHANNEL ?? 'online') as 'online' | 'local',
+      priceCurrency: process.env.GOOGLE_PRICE_CURRENCY ?? 'USD',
+      defaultAvailability: process.env.GOOGLE_DEFAULT_AVAILABILITY ?? 'in stock',
+      defaultCondition: process.env.GOOGLE_PRODUCT_CONDITION ?? 'new',
+      defaultGpc: process.env.GOOGLE_DEFAULT_PRODUCT_CATEGORY,
+    };
+
+    console.log(`Loading feed from: ${cliOptions.xmlPath}`);
+    const feedProducts = await loadFeedProducts(cliOptions.xmlPath);
+    if (!feedProducts.length) {
+      console.warn('No products found in the feed. Proceeding to check for stale products to delete.');
+    }
+
+    const selectedProducts = typeof cliOptions.limit === 'number'
+      ? feedProducts.slice(0, cliOptions.limit)
+      : feedProducts;
+
+    const inferenceOptions: InferenceOptions = {
+      includeDescription: cliOptions.includeDescriptionInInference,
+    };
+
+    const googleProducts = selectedProducts.flatMap((item) =>
+      mapFeedProductToGoogleProduct(item, mappingOptions, categoryMap, manufacturerMap, inferenceOptions),
+    );
+    console.log(`Prepared ${googleProducts.length} variant products for evaluation.`);
+
+    db = await getDatabase();
+    const cachedVariants = loadCachedVariants(db);
+    const seenOfferIds = new Set<string>();
+    const duplicateOfferIds = new Set<string>();
+    const uploadQueue: UploadQueueItem[] = [];
+
+    for (const product of googleProducts) {
+      if (!product.offerId) continue;
+      if (seenOfferIds.has(product.offerId)) {
+        if (!duplicateOfferIds.has(product.offerId)) {
+          duplicateOfferIds.add(product.offerId);
+          logDuplicateOfferId(product);
+        }
+      } else {
+        seenOfferIds.add(product.offerId);
+      }
+      const hash = hashProduct(product);
+      const cached = cachedVariants.get(product.offerId);
+      if (cached && cached.hash === hash) {
+        continue;
+      }
+      uploadQueue.push({ product, hash });
+    }
+
+    const staleOfferIds = Array.from(cachedVariants.keys()).filter((offerId) => !seenOfferIds.has(offerId));
+
+    if (!uploadQueue.length) {
+      console.log('No new or updated products detected in the current feed.');
+    } else {
+      console.log(`Detected ${uploadQueue.length} products that need to be created or updated.`);
+    }
+    if (staleOfferIds.length) {
+      console.log(`Detected ${staleOfferIds.length} products that need to be deleted.`);
+    }
+
+    const contentApi = await createContentClient();
+
+    if (staleOfferIds.length) {
+      await deleteStaleProducts(staleOfferIds, merchantId, mappingOptions, contentApi, db, cliOptions.dryRun);
+    }
+
+    await uploadProducts(uploadQueue, merchantId, contentApi, db, cliOptions.dryRun);
+  } finally {
+    if (db) {
+      db.close();
+      dbInstance = null;
+    }
   }
-
-  const staleOfferIds = Array.from(cachedVariants.keys()).filter((offerId) => !seenOfferIds.has(offerId));
-
-  if (!uploadQueue.length) {
-    console.log('No new or updated products detected in the current feed.');
-  } else {
-    console.log(`Detected ${uploadQueue.length} products that need to be created or updated.`);
-  }
-  if (staleOfferIds.length) {
-    console.log(`Detected ${staleOfferIds.length} products that need to be deleted.`);
-  }
-
-  const contentApi = await createContentClient();
-
-  if (staleOfferIds.length) {
-    await deleteStaleProducts(staleOfferIds, merchantId, mappingOptions, contentApi, db, cliOptions.dryRun);
-  }
-
-  await uploadProducts(uploadQueue, merchantId, contentApi, db, cliOptions.dryRun);
 
   const endTime = Date.now();
   const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
