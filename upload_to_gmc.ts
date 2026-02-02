@@ -1487,6 +1487,8 @@ async function main() {
   const endTime = Date.now();
   const durationSeconds = ((endTime - startTime) / 1000).toFixed(2);
   console.log(`[run] Finished at ${formatTimestamp(endTime)} (EST, duration: ${durationSeconds}s)`);
+  const exitCode = stopRequested ? 130 : 0;
+  process.exit(exitCode);
 }
 
 main().catch((error) => {
