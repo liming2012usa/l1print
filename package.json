@@ -7,7 +7,7 @@
     "start": "node fetch_deconetwork_feed.mjs",
     "build": "tsc",
     "upload:gmc": "npm run build --silent && node dist/upload_to_gmc.js --limit 3",
-    "upload:gmc:ts": "npx tsx upload_to_gmc.ts --limit 3",
+h    "upload:gmc:ts": "npx tsx upload_to_gmc.ts --limit 2000",
     "delete:gmc": "npx tsx delete_products.ts --file data_feeds/products-delete.xml"
   },
   "dependencies": {
