@@ -378,6 +378,18 @@ function sanitizeDescription(description?: string): string {
     .join('\n');
 }
 
+function buildTitleWithBrand(title: string, brand?: string): string {
+  const normalizedTitle = title.trim();
+  const normalizedBrand = brand?.trim();
+  if (!normalizedBrand) {
+    return normalizedTitle;
+  }
+  if (normalizedTitle.toLowerCase().includes(normalizedBrand.toLowerCase())) {
+    return normalizedTitle;
+  }
+  return `${normalizedBrand} ${normalizedTitle}`;
+}
+
 function toArray<T>(value: T | T[] | undefined): T[] {
   if (!value) return [];
   return Array.isArray(value) ? value : [value];
@@ -1224,7 +1236,7 @@ function mapFeedProductToGoogleProduct(
 
   const baseProduct = {
     itemGroupId: itemGroupId ?? baseOfferId,
-    title: product.name?.trim() || baseOfferId,
+    title: buildTitleWithBrand(product.name?.trim() || baseOfferId, manufacturerName),
     description: sanitizedDescription,
     link: productLink,
     contentLanguage: options.contentLanguage,
@@ -1318,9 +1330,10 @@ async function uploadProducts(
       break;
     }
     const { product, hash } = items[index];
+    const displayTitle = (product.title ?? 'n/a').replace(/\s+/g, ' ').trim() || 'n/a';
     const displayColor = product.color ?? 'n/a';
     const displaySize = product.sizes?.[0] ?? 'n/a';
-    const variantLabel = `color: ${displayColor}, size: ${displaySize}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'}`;
+    const variantLabel = `title: ${displayTitle}, color: ${displayColor}, size: ${displaySize}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'}`;
 
     if (!product.offerId) {
       console.warn('Skipping product with missing offerId.');
@@ -1347,7 +1360,7 @@ async function uploadProducts(
             requestBody: product,
           }),
           API_REQUEST_TIMEOUT_MS,
-          `upload product ${product.offerId}`,
+          `upload product ${product.offerId} (${displayTitle})`,
         );
         console.log(`Uploaded product ${product.offerId} (${index + 1}/${items.length}) (${variantLabel})`);
         report.success += 1;
@@ -1359,7 +1372,7 @@ async function uploadProducts(
         });
         break;
       } catch (error) {
-        logApiError(`Failed to upload product ${product.offerId}`, error);
+        logApiError(`Failed to upload product ${product.offerId} (${displayTitle})`, error);
         if (!isNetworkError(error)) {
           report.failed += 1;
           break;
