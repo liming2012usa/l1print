@@ -1389,10 +1389,13 @@ function mapFeedProductToGoogleProduct(
   for (const { label: colorValue, entries: colorEntries } of colorVariants) {
     for (const sizeValue of sizeValues) {
       const sizeEntry = sizeValue ? sizeSourceMap.get(sizeValue.toLowerCase()) : undefined;
+      const imageColorEntries = (colorValue ?? '').trim().toLowerCase() === 'multicolor'
+        ? getMulticolorTitleEntries(colorEntries)
+        : colorEntries;
       const variantImageLinks = buildVariantImageLinks(
         imageEntries,
         product,
-        colorEntries,
+        imageColorEntries,
         sizeEntry,
         options.assetBaseUrl,
       );
@@ -1410,7 +1413,7 @@ function mapFeedProductToGoogleProduct(
         title: buildTitleWithColor(
           baseTitle,
           colorValue,
-          colorEntries,
+          imageColorEntries,
           variantPrimaryImage ?? fallbackPrimaryImage,
           titleImageLinks,
         ),
