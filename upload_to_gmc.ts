@@ -146,6 +146,10 @@ const RETRY_MAX_DELAY_MS = 120_000;
 const DEFAULT_GENDER: GenderValue = 'male';
 const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
+const MAX_PRODUCT_TITLE_LENGTH = 150;
+const TITLE_COLOR_SEPARATOR = ' - ';
+const TITLE_MULTI_COLOR_SUFFIX = ' & More Colors';
+const TITLE_MULTIPLE_COLORS_FALLBACK = `${TITLE_COLOR_SEPARATOR}Multiple Colors`;
 
 const COLOR_RED = '\x1b[31m';
 const COLOR_RESET = '\x1b[0m';
@@ -388,6 +392,127 @@ function buildTitleWithBrand(title: string, brand?: string): string {
     return normalizedTitle;
   }
   return `${normalizedBrand} ${normalizedTitle}`;
+}
+
+function buildTitleWithColor(
+  baseTitle: string,
+  colorLabel: string | undefined,
+  colorEntries: FeedColor[],
+  primaryImageLink?: string,
+  imageLinks: string[] = [],
+): string {
+  const normalizedBaseTitle = baseTitle.trim();
+  if (!normalizedBaseTitle) {
+    return normalizedBaseTitle;
+  }
+
+  let colorSuffix: string | undefined;
+  const normalizedLabel = (colorLabel ?? '').trim().toLowerCase();
+  const titleColorEntries = normalizedLabel === 'multicolor'
+    ? getMulticolorTitleEntries(colorEntries)
+    : colorEntries;
+  if (titleColorEntries.length > 1) {
+    const firstImageColor = resolveColorLabelFromImageUrls(imageLinks, titleColorEntries)
+      ?? resolveColorLabelFromImageUrl(primaryImageLink, titleColorEntries);
+    const firstColor = firstImageColor ?? buildColorLabel(titleColorEntries[0]) ?? colorLabel;
+    if (firstColor) {
+      colorSuffix = `${firstColor}${TITLE_MULTI_COLOR_SUFFIX}`;
+    } else {
+      colorSuffix = 'Multiple Colors';
+    }
+  } else if (titleColorEntries.length === 1) {
+    colorSuffix = buildColorLabel(titleColorEntries[0]) ?? colorLabel;
+  } else if (colorEntries.length > 1) {
+    const firstImageColor = resolveColorLabelFromImageUrls(imageLinks, colorEntries)
+      ?? resolveColorLabelFromImageUrl(primaryImageLink, colorEntries);
+    const firstColor = firstImageColor ?? buildColorLabel(colorEntries[0]) ?? colorLabel;
+    if (firstColor) {
+      colorSuffix = `${firstColor}${TITLE_MULTI_COLOR_SUFFIX}`;
+    } else {
+      colorSuffix = 'Multiple Colors';
+    }
+  } else if (colorEntries.length === 1) {
+    colorSuffix = buildColorLabel(colorEntries[0]) ?? colorLabel;
+  } else if (colorLabel) {
+    colorSuffix = colorLabel;
+  }
+
+  if (!colorSuffix) {
+    return normalizedBaseTitle;
+  }
+
+  const preferredTitle = `${normalizedBaseTitle}${TITLE_COLOR_SEPARATOR}${colorSuffix}`;
+  if (preferredTitle.length <= MAX_PRODUCT_TITLE_LENGTH) {
+    return preferredTitle;
+  }
+
+  return buildTitleWithMultipleColorsFallback(normalizedBaseTitle);
+}
+
+function buildTitleWithMultipleColorsFallback(baseTitle: string): string {
+  const normalizedBaseTitle = baseTitle.trim();
+  const fallbackTitle = `${normalizedBaseTitle}${TITLE_MULTIPLE_COLORS_FALLBACK}`;
+  if (fallbackTitle.length <= MAX_PRODUCT_TITLE_LENGTH) {
+    return fallbackTitle;
+  }
+
+  const maxBaseLength = MAX_PRODUCT_TITLE_LENGTH - TITLE_MULTIPLE_COLORS_FALLBACK.length;
+  if (maxBaseLength <= 0) {
+    return TITLE_MULTIPLE_COLORS_FALLBACK.trim().slice(0, MAX_PRODUCT_TITLE_LENGTH);
+  }
+  const trimmedBase = normalizedBaseTitle.slice(0, maxBaseLength).trim();
+  if (!trimmedBase) {
+    return TITLE_MULTIPLE_COLORS_FALLBACK.trim().slice(0, MAX_PRODUCT_TITLE_LENGTH);
+  }
+  return `${trimmedBase}${TITLE_MULTIPLE_COLORS_FALLBACK}`;
+}
+
+function getMulticolorTitleEntries(entries: FeedColor[]): FeedColor[] {
+  const filtered = entries.filter((entry) => {
+    const tokens = getColorNameTokens(entry);
+    if (!tokens.length) {
+      return true;
+    }
+    return !tokens.some((token) =>
+      Boolean(
+        matchColorKeyword(token, NEUTRAL_COLOR_KEYWORDS)
+        || matchColorKeyword(token, BLUE_COLOR_KEYWORDS),
+      ),
+    );
+  });
+  return filtered.length ? filtered : entries;
+}
+
+function resolveColorLabelFromImageUrl(
+  imageUrl: string | undefined,
+  colorEntries: FeedColor[],
+): string | undefined {
+  if (!imageUrl || !colorEntries.length) {
+    return undefined;
+  }
+  for (const entry of colorEntries) {
+    const colorId = entry.color_id ?? entry.id;
+    if (!colorId) {
+      continue;
+    }
+    if (imageUrl.includes(`/${colorId}/`)) {
+      return buildColorLabel(entry);
+    }
+  }
+  return undefined;
+}
+
+function resolveColorLabelFromImageUrls(
+  imageUrls: string[],
+  colorEntries: FeedColor[],
+): string | undefined {
+  for (const imageUrl of imageUrls) {
+    const match = resolveColorLabelFromImageUrl(imageUrl, colorEntries);
+    if (match) {
+      return match;
+    }
+  }
+  return undefined;
 }
 
 function toArray<T>(value: T | T[] | undefined): T[] {
@@ -1233,10 +1358,11 @@ function mapFeedProductToGoogleProduct(
   const manufacturerName = product.manufacturer_id
     ? manufacturerMap[String(product.manufacturer_id)] ?? String(product.manufacturer_id)
     : undefined;
+  const baseTitle = buildTitleWithBrand(product.name?.trim() || baseOfferId, manufacturerName);
 
   const baseProduct = {
     itemGroupId: itemGroupId ?? baseOfferId,
-    title: buildTitleWithBrand(product.name?.trim() || baseOfferId, manufacturerName),
+    title: baseTitle,
     description: sanitizedDescription,
     link: productLink,
     contentLanguage: options.contentLanguage,
@@ -1273,11 +1399,21 @@ function mapFeedProductToGoogleProduct(
       const [variantPrimaryImage, ...variantAdditionalImages] = variantImageLinks.length
         ? variantImageLinks
         : defaultImageLinks;
+      const titleImageLinks = [variantPrimaryImage, ...variantAdditionalImages].filter(
+        (value): value is string => Boolean(value),
+      );
 
       const variant: SchemaProduct = {
         ...baseProduct,
         offerId: buildVariantOfferId(baseOfferId, colorValue, sizeValue),
         itemGroupId: baseProduct.itemGroupId ?? baseOfferId,
+        title: buildTitleWithColor(
+          baseTitle,
+          colorValue,
+          colorEntries,
+          variantPrimaryImage ?? fallbackPrimaryImage,
+          titleImageLinks,
+        ),
         color: colorValue,
         sizes: sizeValue ? [sizeValue] : undefined,
         imageLink: variantPrimaryImage ?? fallbackPrimaryImage,
