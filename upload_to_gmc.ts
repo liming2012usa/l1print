@@ -1794,14 +1794,44 @@ export {
   indexBatchResults,
   buildVariantOfferId,
   hashProduct,
+  upsertVariantRecord,
   upsertVariantRecords,
   deleteVariantRecords,
   loadCachedVariants,
   runProductsCustomBatch,
   uploadProducts,
   deleteStaleProducts,
+  // pure helpers / pipeline
+  ensureAbsoluteUrl,
+  slugify,
+  applyTemplate,
+  sanitizeDescription,
+  buildTitleWithBrand,
+  buildTitleWithColor,
+  toArray,
+  shouldExcludeSize,
+  getEnvVar,
+  resolvePath,
+  parseCliArgs,
+  getRetryDelayMs,
+  withTimeout,
+  describeVariant,
+  logApiError,
+  logDuplicateOfferId,
+  loadFeedProducts,
+  loadMetaDataMaps,
+  loadInlineCredentialsFromEnv,
+  mapFeedProductToGoogleProduct,
 };
-export type { MappingOptions, CachedVariantRecord, UploadQueueItem, SqliteDatabase };
+export type {
+  MappingOptions,
+  CachedVariantRecord,
+  UploadQueueItem,
+  SqliteDatabase,
+  InferenceOptions,
+  FeedProduct,
+  CliOptions,
+};
 function logApiError(context: string, error: unknown) {
   if (error && typeof error === 'object' && 'errors' in (error as Record<string, unknown>)) {
     const errObj = error as {

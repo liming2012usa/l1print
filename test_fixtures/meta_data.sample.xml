@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<meta>
+  <categories>
+    <category>
+      <id>8556391</id>
+      <name/>
+      <category>
+        <id>8699171</id>
+        <name>Feature Brands</name>
+        <category>
+          <id>8699271</id>
+          <name>Port Authority</name>
+          <category>
+            <id>8701266</id>
+            <name>Port Authority Polos</name>
+          </category>
+          <category>
+            <id>8701281</id>
+            <name>Port Authority Jackets</name>
+          </category>
+          <category>
+            <id>8703706</id>
+            <name>Port Authority Bags</name>
+          </category>
+        </category>
+        <category>
+          <id>8722681</id>
+          <name>Richardson</name>
+          <category>
+            <id>8722691</id>
+            <name>5 Panel Hats</name>
+          </category>
+          <category>
+            <id>8722696</id>
+            <name>Rope Hats</name>
+          </category>
+        </category>
+      </category>
+      <category>
+        <id>8665616</id>
+        <name>Polo Shirts</name>
+        <category>
+          <id>8669386</id>
+          <name>Embroidered Polo Shirts</name>
+        </category>
+        <category>
+          <id>8669391</id>
+          <name>Printed Polo Shirts</name>
+        </category>
+        <category>
+          <id>8705966</id>
+          <name>Short Sleeve Polo Shirts</name>
+        </category>
+        <category>
+          <id>8669406</id>
+          <name>Long Sleeve Polo Shirts</name>
+        </category>
+        <category>
+          <id>8669411</id>
+          <name>Women's Polo Shirts</name>
+        </category>
+      </category>
+      <category>
+        <id>8665621</id>
+        <name>Jackets</name>
+        <category>
+          <id>8669456</id>
+          <name>Rain Jackets</name>
+        </category>
+      </category>
+      <category>
+        <id>8556561</id>
+        <name>Bags</name>
+        <category>
+          <id>8556566</id>
+          <name>Duffles</name>
+        </category>
+      </category>
+      <category>
+        <id>8673696</id>
+        <name>Hats</name>
+        <category>
+          <id>8673706</id>
+          <name>Trucker Hats</name>
+        </category>
+        <category>
+          <id>8706181</id>
+          <name>Embroidered Hats</name>
+        </category>
+      </category>
+      <category>
+        <id>8556411</id>
+        <name>Women's</name>
+        <category>
+          <id>8556456</id>
+          <name>Women's Polo Shirts</name>
+        </category>
+      </category>
+      <category>
+        <id>8556421</id>
+        <name>Kids</name>
+        <category>
+          <id>8556801</id>
+          <name>Kids Polo Shirts</name>
+          <category>
+            <id>8699521</id>
+            <name>Short Sleeve</name>
+          </category>
+        </category>
+      </category>
+      <category>
+        <id>8715176</id>
+        <name>Embroidered</name>
+        <category>
+          <id>8716771</id>
+          <name>Embroidered Polo Shirts</name>
+        </category>
+        <category>
+          <id>8716776</id>
+          <name>Embroidered Jackets</name>
+          <category>
+            <id>8716846</id>
+            <name>Rain Jackets</name>
+          </category>
+        </category>
+        <category>
+          <id>8716781</id>
+          <name>Embroidered Bags</name>
+          <category>
+            <id>8716806</id>
+            <name>Duffles</name>
+          </category>
+        </category>
+      </category>
+    </category>
+  </categories>
+  <manufacturers>
+    <manufacturer>
+      <id>22</id>
+      <name>Port Authority</name>
+    </manufacturer>
+    <manufacturer>
+      <id>133</id>
+      <name>Columbia</name>
+    </manufacturer>
+    <manufacturer>
+      <id>25617</id>
+      <name>Richardson</name>
+    </manufacturer>
+  </manufacturers>
+</meta>

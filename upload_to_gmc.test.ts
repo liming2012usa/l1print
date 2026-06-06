@@ -1,5 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+import { writeFile, mkdtemp } from 'node:fs/promises';
 import Database from 'better-sqlite3';
 import type { content_v2_1 } from 'googleapis';
 import {
@@ -12,17 +16,59 @@ import {
   buildVariantOfferId,
   hashProduct,
   loadCachedVariants,
+  upsertVariantRecord,
   upsertVariantRecords,
   runProductsCustomBatch,
   uploadProducts,
   deleteStaleProducts,
+  ensureAbsoluteUrl,
+  slugify,
+  applyTemplate,
+  sanitizeDescription,
+  buildTitleWithBrand,
+  buildTitleWithColor,
+  toArray,
+  shouldExcludeSize,
+  getEnvVar,
+  resolvePath,
+  parseCliArgs,
+  getRetryDelayMs,
+  withTimeout,
+  describeVariant,
+  logApiError,
+  logDuplicateOfferId,
+  loadFeedProducts,
+  loadMetaDataMaps,
+  loadInlineCredentialsFromEnv,
+  mapFeedProductToGoogleProduct,
 } from './upload_to_gmc.js';
 import type {
   MappingOptions,
   UploadQueueItem,
   CachedVariantRecord,
   SqliteDatabase,
+  InferenceOptions,
 } from './upload_to_gmc.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const FIXTURES = path.join(HERE, 'test_fixtures');
+const FIXTURE_PRODUCTS = path.join(FIXTURES, 'products.sample.xml');
+const FIXTURE_META = path.join(FIXTURES, 'meta_data.sample.xml');
+
+function fullMapping(): MappingOptions {
+  return {
+    baseStoreUrl: 'https://l1print.com/',
+    assetBaseUrl: 'https://assets.l1print.com/',
+    productPathTemplate: '/blank_product/{id}/{nameSlug}',
+    contentLanguage: 'en',
+    targetCountry: 'US',
+    channel: 'online',
+    priceCurrency: 'USD',
+    defaultAvailability: 'in stock',
+    defaultCondition: 'new',
+    defaultGpc: '212',
+  };
+}
 
 // ---------- test helpers ----------
 
@@ -254,5 +300,263 @@ test('deleteStaleProducts dry-run makes no API calls and purges nothing', async 
 
   assert.equal(calls.length, 0);
   assert.equal(loadCachedVariants(db).has('A'), true);
+  db.close();
+});
+
+// ---------- pure string/url/title helpers ----------
+
+test('slugify normalizes to lowercase kebab and strips punctuation', () => {
+  assert.equal(slugify('Hello World!'), 'hello-world');
+  assert.equal(slugify("Port Authority Women's Polo"), 'port-authority-womens-polo');
+  assert.equal(slugify('  multiple   spaces_and-dashes '), 'multiple-spaces-and-dashes');
+  assert.equal(slugify(undefined), '');
+  assert.equal(slugify(''), '');
+});
+
+test('ensureAbsoluteUrl joins relative paths and passes through absolute', () => {
+  assert.equal(ensureAbsoluteUrl('https://x.com/', '/a/b.png'), 'https://x.com/a/b.png');
+  assert.equal(ensureAbsoluteUrl('https://x.com', 'a/b.png'), 'https://x.com/a/b.png');
+  assert.equal(ensureAbsoluteUrl('https://x.com/', 'https://cdn.com/c.png'), 'https://cdn.com/c.png');
+  assert.equal(ensureAbsoluteUrl('https://x.com/', undefined), undefined);
+});
+
+test('applyTemplate substitutes id/code/nameSlug', () => {
+  const out = applyTemplate('/p/{id}/{code}/{nameSlug}', { id: '1', code: 'C9', name: 'Red Shirt' });
+  assert.equal(out, '/p/1/C9/red-shirt');
+});
+
+test('sanitizeDescription decodes entities, converts markup, drops tags', () => {
+  const out = sanitizeDescription('<p>Hello&amp;Co</p><ul><li>One</li><li>Two</li></ul>');
+  assert.ok(out.includes('Hello&Co'));
+  assert.ok(out.includes('• One'));
+  assert.ok(out.includes('• Two'));
+  assert.ok(!out.includes('<'));
+  assert.equal(sanitizeDescription(undefined), '');
+});
+
+test('buildTitleWithBrand prepends brand unless already present', () => {
+  assert.equal(buildTitleWithBrand('Polo', 'Nike'), 'Nike Polo');
+  assert.equal(buildTitleWithBrand('Nike Polo', 'Nike'), 'Nike Polo');
+  assert.equal(buildTitleWithBrand('Polo', undefined), 'Polo');
+  assert.equal(buildTitleWithBrand('Polo', '   '), 'Polo');
+});
+
+test('buildTitleWithColor appends a single color and "& More Colors" for many', () => {
+  const single = buildTitleWithColor('Tee', 'Red', [{ clr: { name: 'Red' } }]);
+  assert.equal(single, 'Tee - Red');
+  const many = buildTitleWithColor('Tee', undefined, [{ clr: { name: 'Red' } }, { clr: { name: 'Blue' } }]);
+  assert.ok(many.includes('& More Colors'));
+  assert.equal(buildTitleWithColor('', 'Red', []), '');
+  // overlong base falls back to "Multiple Colors" truncation path
+  const longBase = 'X'.repeat(200);
+  const fallback = buildTitleWithColor(longBase, undefined, [{ clr: { name: 'Red' } }, { clr: { name: 'Blue' } }]);
+  assert.ok(fallback.length <= 150);
+});
+
+test('toArray normalizes scalar/array/undefined', () => {
+  assert.deepEqual(toArray(undefined), []);
+  assert.deepEqual(toArray('x'), ['x']);
+  assert.deepEqual(toArray(['x', 'y']), ['x', 'y']);
+});
+
+test('shouldExcludeSize matches only the oversized tokens', () => {
+  assert.equal(shouldExcludeSize('3XL'), true);
+  assert.equal(shouldExcludeSize('4xl'), true);
+  assert.equal(shouldExcludeSize(' 6XL '), true);
+  assert.equal(shouldExcludeSize('M'), false);
+  assert.equal(shouldExcludeSize('2XL'), false);
+  assert.equal(shouldExcludeSize(''), false);
+});
+
+test('describeVariant collapses whitespace and labels attributes', () => {
+  const { displayTitle, variantLabel } = describeVariant({ title: '  A   B ', color: 'Red', sizes: ['M'] });
+  assert.equal(displayTitle, 'A B');
+  assert.ok(variantLabel.includes('color: Red'));
+  assert.ok(variantLabel.includes('size: M'));
+  const fallback = describeVariant({});
+  assert.ok(fallback.displayTitle === 'n/a');
+});
+
+// ---------- env / cli / path helpers ----------
+
+test('getEnvVar returns value, fallback, or throws', () => {
+  process.env.__TEST_VAR__ = '  hello  ';
+  assert.equal(getEnvVar('__TEST_VAR__'), 'hello');
+  delete process.env.__TEST_VAR__;
+  assert.equal(getEnvVar('__TEST_VAR__', 'fb'), 'fb');
+  assert.throws(() => getEnvVar('__TEST_VAR__'));
+});
+
+test('resolvePath handles absolute, relative and default', () => {
+  assert.equal(resolvePath('/abs/x.xml'), '/abs/x.xml');
+  assert.equal(resolvePath('rel.xml'), path.resolve(process.cwd(), 'rel.xml'));
+  assert.ok(path.isAbsolute(resolvePath(undefined)));
+});
+
+test('parseCliArgs parses all flags (space and = forms)', () => {
+  const a = parseCliArgs(['--xml', '/x.xml', '--meta', '/m.xml', '--dry-run', '--limit', '50', '--batch-size', '200', '--infer-description']);
+  assert.equal(a.xmlPath, '/x.xml');
+  assert.equal(a.metaPath, '/m.xml');
+  assert.equal(a.dryRun, true);
+  assert.equal(a.limit, 50);
+  assert.equal(a.batchSize, 200);
+  assert.equal(a.includeDescriptionInInference, true);
+
+  const b = parseCliArgs(['--xml=/y.xml', '--meta=/n.xml', '--limit=10', '--batch-size=300', '--no-infer-description']);
+  assert.equal(b.xmlPath, '/y.xml');
+  assert.equal(b.limit, 10);
+  assert.equal(b.batchSize, 300);
+  assert.equal(b.includeDescriptionInInference, false);
+
+  const c = parseCliArgs([]);
+  assert.equal(c.dryRun, false);
+  assert.equal(c.batchSize, 500); // default
+});
+
+test('getRetryDelayMs grows exponentially and caps', () => {
+  assert.equal(getRetryDelayMs(0), 10_000);
+  assert.equal(getRetryDelayMs(1), 20_000);
+  assert.equal(getRetryDelayMs(2), 40_000);
+  assert.equal(getRetryDelayMs(50), 120_000); // capped at RETRY_MAX_DELAY_MS
+});
+
+test('withTimeout resolves fast promises and rejects slow ones', async () => {
+  assert.equal(await withTimeout(Promise.resolve(42), 1000, 'fast'), 42);
+  await assert.rejects(
+    () => withTimeout(new Promise(() => {}), 5, 'slow'),
+    /timed out/,
+  );
+});
+
+// ---------- logging helpers (coverage: must not throw) ----------
+
+test('logApiError handles structured, Error and primitive inputs', async () => {
+  await quiet(async () => {
+    logApiError('ctx', { errors: [{ reason: 'notFound', message: 'gone' }] });
+    logApiError('ctx', new Error('boom'));
+    logApiError('ctx', 'weird');
+  });
+  assert.ok(true);
+});
+
+test('logDuplicateOfferId formats a line', async () => {
+  await quiet(async () => {
+    logDuplicateOfferId({ offerId: 'A', itemGroupId: 'g', color: 'Red', sizes: ['M'], title: 'T' });
+  });
+  assert.ok(true);
+});
+
+// ---------- credentials ----------
+
+test('loadInlineCredentialsFromEnv: unset, inline JSON, file path, invalid', async () => {
+  const original = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  try {
+    delete process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    assert.equal(await loadInlineCredentialsFromEnv(), undefined);
+
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON = '{"client_email":"svc@x.iam"}';
+    assert.deepEqual(await loadInlineCredentialsFromEnv(), { client_email: 'svc@x.iam' });
+
+    const dir = await mkdtemp(path.join(os.tmpdir(), 'gmc-cred-'));
+    const file = path.join(dir, 'key.json');
+    await writeFile(file, '{"client_email":"file@x.iam"}');
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON = file;
+    assert.deepEqual(await loadInlineCredentialsFromEnv(), { client_email: 'file@x.iam' });
+
+    process.env.GOOGLE_SERVICE_ACCOUNT_JSON = '{not valid';
+    assert.equal(await quiet(() => loadInlineCredentialsFromEnv()), undefined);
+  } finally {
+    if (original === undefined) delete process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    else process.env.GOOGLE_SERVICE_ACCOUNT_JSON = original;
+  }
+});
+
+// ---------- feed / metadata loading ----------
+
+test('loadMetaDataMaps parses categories and manufacturers; bad path -> empty', async () => {
+  const meta = await loadMetaDataMaps(FIXTURE_META);
+  assert.ok(Object.keys(meta.categories).length > 0);
+  assert.ok(Object.keys(meta.manufacturers).length > 0);
+
+  const empty = await quiet(() => loadMetaDataMaps('/no/such/file.xml'));
+  assert.deepEqual(empty, { categories: {}, manufacturers: {} });
+});
+
+test('loadFeedProducts reads products; empty doc -> []', async () => {
+  const products = await loadFeedProducts(FIXTURE_PRODUCTS);
+  assert.ok(products.length >= 5);
+
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'gmc-feed-'));
+  const empty = path.join(dir, 'empty.xml');
+  await writeFile(empty, '<?xml version="1.0"?><products></products>');
+  assert.deepEqual(await loadFeedProducts(empty), []);
+});
+
+// ---------- full mapping pipeline (covers color/image/inference helpers) ----------
+
+test('mapFeedProductToGoogleProduct produces valid variants across fixture catalog', async () => {
+  const meta = await loadMetaDataMaps(FIXTURE_META);
+  const products = await loadFeedProducts(FIXTURE_PRODUCTS);
+  const mapping = fullMapping();
+  const inference: InferenceOptions = { includeDescription: false };
+
+  let totalVariants = 0;
+  const offerIds = new Set<string>();
+  for (const product of products) {
+    const variants = mapFeedProductToGoogleProduct(product, mapping, meta.categories, meta.manufacturers, inference);
+    assert.ok(variants.length > 0, 'each product yields at least one variant');
+    for (const v of variants) {
+      assert.ok(v.offerId, 'offerId set');
+      assert.ok(v.title && v.title.length > 0 && v.title.length <= 150, 'title within GMC limit');
+      assert.ok(['male', 'female', 'unisex'].includes(String(v.gender)));
+      assert.ok(['newborn', 'infant', 'toddler', 'kids', 'adult'].includes(String(v.ageGroup)));
+      assert.equal(v.channel, 'online');
+      assert.equal(v.contentLanguage, 'en');
+      assert.equal(v.targetCountry, 'US');
+      assert.ok(v.link?.startsWith('https://l1print.com/'));
+      offerIds.add(String(v.offerId));
+    }
+    totalVariants += variants.length;
+  }
+  assert.ok(totalVariants > products.length, 'variants expand beyond raw products');
+  assert.ok(offerIds.size > 0);
+});
+
+test('mapFeedProductToGoogleProduct with includeDescription inference still maps', async () => {
+  const meta = await loadMetaDataMaps(FIXTURE_META);
+  const products = await loadFeedProducts(FIXTURE_PRODUCTS);
+  const variants = mapFeedProductToGoogleProduct(
+    products[0],
+    fullMapping(),
+    meta.categories,
+    meta.manufacturers,
+    { includeDescription: true },
+  );
+  assert.ok(variants.length > 0);
+  assert.ok(variants.every((v) => v.offerId));
+});
+
+test('mapFeedProductToGoogleProduct handles a minimal product with no colors/sizes', () => {
+  const variants = mapFeedProductToGoogleProduct(
+    { id: '9', code: 'Z9', name: 'Bare Item', price: '5' },
+    fullMapping(),
+    {},
+    {},
+    { includeDescription: false },
+  );
+  assert.equal(variants.length, 1);
+  assert.equal(variants[0].offerId, 'Z9-9-variant');
+  assert.equal(variants[0].price?.value, '5.00');
+});
+
+// ---------- single-record upsert ----------
+
+test('upsertVariantRecord inserts then updates on conflict', () => {
+  const db = makeDb();
+  upsertVariantRecord(db, record('A', 'h1'));
+  assert.equal(loadCachedVariants(db).get('A')?.hash, 'h1');
+  upsertVariantRecord(db, record('A', 'h2'));
+  assert.equal(loadCachedVariants(db).get('A')?.hash, 'h2');
+  assert.equal(loadCachedVariants(db).size, 1);
   db.close();
 });
