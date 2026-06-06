@@ -641,12 +641,17 @@ function upsertVariantRecord(db: SqliteDatabase, record: CachedVariantRecord): v
 
 function upsertVariantRecords(db: SqliteDatabase, records: CachedVariantRecord[]): void {
   if (!records.length) return;
-  const runAll = db.transaction((rows: CachedVariantRecord[]) => {
-    for (const row of rows) {
+  // Wrap the batch in a single transaction so a chunk of upserts is one fsync.
+  db.exec('BEGIN');
+  try {
+    for (const row of records) {
       upsertVariantRecord(db, row);
     }
-  });
-  runAll(records);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 function deleteVariantRecords(db: SqliteDatabase, offerIds: string[]): void {
