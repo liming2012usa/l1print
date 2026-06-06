@@ -701,6 +701,17 @@ async function deleteStaleProducts(
         console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
         break;
       } catch (error) {
+        if (isNotFoundError(error)) {
+          // Product is already absent from Merchant Center (e.g. the offerId
+          // generation changed, so this stale record points at an ID that was
+          // never uploaded). The desired end state is reached; purge the local
+          // record so it stops being flagged stale and retried on every run.
+          deleteVariantRecords(db, [offerId]);
+          console.log(
+            `Product ${restId} already absent from Merchant Center; removed stale local record (${index + 1}/${offerIds.length})`,
+          );
+          break;
+        }
         logApiError(`Failed to delete product ${restId}`, error);
         if (!isNetworkError(error)) {
           break;
@@ -1611,14 +1622,29 @@ async function main() {
       uploadQueue.push({ product, hash });
     }
 
-    const staleOfferIds = Array.from(cachedVariants.keys()).filter((offerId) => !seenOfferIds.has(offerId));
+    // Stale deletion is a garbage-collection step: it removes cached products
+    // that are absent from the desired state (the feed). That is only safe when
+    // we evaluated the COMPLETE feed. With a partial `--limit`, seenOfferIds only
+    // covers the slice, so every product beyond the limit would be wrongly
+    // flagged stale and deleted from Merchant Center. Skip deletion in that case.
+    const isPartialFeed = selectedProducts.length < feedProducts.length;
+    const staleOfferIds = isPartialFeed
+      ? []
+      : Array.from(cachedVariants.keys()).filter((offerId) => !seenOfferIds.has(offerId));
 
     if (!uploadQueue.length) {
       console.log('No new or updated products detected in the current feed.');
     } else {
       console.log(`Detected ${uploadQueue.length} products that need to be created or updated.`);
     }
-    if (staleOfferIds.length) {
+    if (isPartialFeed) {
+      console.warn(
+        colorizeRed(
+          `[skip-delete] Processed ${selectedProducts.length}/${feedProducts.length} feed products (partial run via --limit). ` +
+            'Skipping stale-product deletion to avoid removing valid products that were not evaluated.',
+        ),
+      );
+    } else if (staleOfferIds.length) {
       console.log(`Detected ${staleOfferIds.length} products that need to be deleted.`);
     }
 
@@ -1673,6 +1699,23 @@ function logDuplicateOfferId(product: SchemaProduct) {
       `[dup] offerId=${product.offerId} | itemGroupId=${itemGroupId} | color=${color} | size=${size} | title=${title}`,
     ),
   );
+}
+
+function isNotFoundError(error: unknown): boolean {
+  if (error && typeof error === 'object') {
+    const errObj = error as {
+      errors?: Array<{ reason?: string }>;
+      code?: unknown;
+      status?: unknown;
+    };
+    if (errObj.errors?.some((entry) => entry?.reason === 'notFound')) {
+      return true;
+    }
+    if (errObj.code === 404 || errObj.code === '404' || errObj.status === 404) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const NETWORK_ERROR_CODES = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT']);
