@@ -21,6 +21,7 @@ interface CliOptions {
   metaPath: string;
   dryRun: boolean;
   limit?: number;
+  batchSize: number;
   includeDescriptionInInference: boolean;
 }
 
@@ -143,6 +144,10 @@ const PREFERRED_IMAGE_SIZE_ID = '13';
 const API_REQUEST_TIMEOUT_MS = 60_000;
 const RETRY_BASE_DELAY_MS = 10_000;
 const RETRY_MAX_DELAY_MS = 120_000;
+// products.custombatch packs many operations into a single API round-trip.
+// Google accepts large batches; we keep a conservative default and a hard cap.
+const DEFAULT_BATCH_SIZE = 500;
+const MAX_BATCH_SIZE = 1000;
 const DEFAULT_GENDER: GenderValue = 'male';
 const DEFAULT_KIDS_GENDER: GenderValue = 'unisex';
 const DEFAULT_AGE_GROUP: AgeGroupValue = 'adult';
@@ -244,6 +249,7 @@ function parseCliArgs(args: string[]): CliOptions {
   let metaPath = DEFAULT_META_PATH;
   let dryRun = false;
   let limit: number | undefined;
+  let batchSize = parseBatchSize(process.env.GMC_BATCH_SIZE) ?? DEFAULT_BATCH_SIZE;
   let includeDescriptionInInference = false;
 
   for (let i = 0; i < args.length; i += 1) {
@@ -273,10 +279,16 @@ function parseCliArgs(args: string[]): CliOptions {
     } else if (arg.startsWith('--limit=')) {
       const [, value] = arg.split('=');
       limit = parseLimit(value);
+    } else if (arg === '--batch-size' && args[i + 1]) {
+      batchSize = parseBatchSize(args[i + 1]) ?? batchSize;
+      i += 1;
+    } else if (arg.startsWith('--batch-size=')) {
+      const [, value] = arg.split('=');
+      batchSize = parseBatchSize(value) ?? batchSize;
     }
   }
 
-  return { xmlPath, metaPath, dryRun, limit, includeDescriptionInInference };
+  return { xmlPath, metaPath, dryRun, limit, batchSize, includeDescriptionInInference };
 }
 
 function resolvePath(inputPath?: string): string {
@@ -293,6 +305,15 @@ function parseLimit(value?: string): number | undefined {
   const parsed = Number(value);
   if (Number.isFinite(parsed) && parsed > 0) {
     return parsed;
+  }
+  return undefined;
+}
+
+function parseBatchSize(value?: string): number | undefined {
+  if (!value) return undefined;
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 1) {
+    return Math.min(Math.floor(parsed), MAX_BATCH_SIZE);
   }
   return undefined;
 }
@@ -618,6 +639,16 @@ function upsertVariantRecord(db: SqliteDatabase, record: CachedVariantRecord): v
   stmt.run(record);
 }
 
+function upsertVariantRecords(db: SqliteDatabase, records: CachedVariantRecord[]): void {
+  if (!records.length) return;
+  const runAll = db.transaction((rows: CachedVariantRecord[]) => {
+    for (const row of rows) {
+      upsertVariantRecord(db, row);
+    }
+  });
+  runAll(records);
+}
+
 function deleteVariantRecords(db: SqliteDatabase, offerIds: string[]): void {
   if (!offerIds.length) return;
   const stmt = db.prepare('DELETE FROM product_variants WHERE offer_id = ?');
@@ -658,6 +689,54 @@ function createRestProductId(offerId: string, mapping: MappingOptions): string {
   return `${mapping.channel}:${mapping.contentLanguage}:${mapping.targetCountry}:${offerId}`;
 }
 
+// Sends a single products.custombatch request, retrying the whole batch on
+// transient network failures (the same policy the per-item loops used). Returns
+// the per-entry results, or null when the request failed for a non-retryable
+// reason (or a stop was requested) so the caller can leave local state untouched.
+async function runProductsCustomBatch(
+  contentApi: content_v2_1.Content,
+  entries: content_v2_1.Schema$ProductsCustomBatchRequestEntry[],
+  label: string,
+): Promise<content_v2_1.Schema$ProductsCustomBatchResponseEntry[] | null> {
+  let attempt = 0;
+  while (true) {
+    if (isStopRequested()) {
+      return null;
+    }
+    try {
+      const response = await withTimeout(
+        contentApi.products.custombatch({ requestBody: { entries } }),
+        API_REQUEST_TIMEOUT_MS,
+        label,
+      );
+      return response.data.entries ?? [];
+    } catch (error) {
+      logApiError(`${label} request failed`, error);
+      if (!isNetworkError(error)) {
+        return null;
+      }
+      const delayMs = getRetryDelayMs(attempt);
+      attempt += 1;
+      console.error(
+        colorizeRed(`Network issue detected. Retrying ${label} in ${Math.round(delayMs / 1000)}s...`),
+      );
+      await sleep(delayMs);
+    }
+  }
+}
+
+function indexBatchResults(
+  entries: content_v2_1.Schema$ProductsCustomBatchResponseEntry[],
+): Map<number, content_v2_1.Schema$ProductsCustomBatchResponseEntry> {
+  const byId = new Map<number, content_v2_1.Schema$ProductsCustomBatchResponseEntry>();
+  for (const entry of entries) {
+    if (typeof entry.batchId === 'number') {
+      byId.set(entry.batchId, entry);
+    }
+  }
+  return byId;
+}
+
 async function deleteStaleProducts(
   offerIds: string[],
   merchantId: string,
@@ -665,65 +744,71 @@ async function deleteStaleProducts(
   contentApi: content_v2_1.Content,
   db: SqliteDatabase,
   dryRun: boolean,
+  batchSize: number,
 ): Promise<void> {
   if (!offerIds.length) {
     return;
   }
 
-  for (let index = 0; index < offerIds.length; index += 1) {
+  const total = offerIds.length;
+  for (let start = 0; start < total; start += batchSize) {
     if (isStopRequested()) {
       console.log('Stop requested. Halting product deletion loop.');
       break;
     }
-    const offerId = offerIds[index];
-    const restId = createRestProductId(offerId, mappingOptions);
+    const chunk = offerIds.slice(start, start + batchSize);
+
     if (dryRun) {
-      console.log(`[dry-run] (${index + 1}/${offerIds.length}) Would delete product ${restId}`);
+      chunk.forEach((offerId, i) => {
+        const restId = createRestProductId(offerId, mappingOptions);
+        console.log(`[dry-run] (${start + i + 1}/${total}) Would delete product ${restId}`);
+      });
       continue;
     }
 
-    let attempt = 0;
-    while (true) {
-      if (isStopRequested()) {
-        console.log('Stop requested. Halting product deletion loop.');
-        break;
-      }
-      try {
-        await withTimeout(
-          contentApi.products.delete({
-            merchantId,
-            productId: restId,
-          }),
-          API_REQUEST_TIMEOUT_MS,
-          `delete product ${restId}`,
+    const entries: content_v2_1.Schema$ProductsCustomBatchRequestEntry[] = chunk.map((offerId, i) => ({
+      batchId: i,
+      merchantId,
+      method: 'delete',
+      productId: createRestProductId(offerId, mappingOptions),
+    }));
+
+    const results = await runProductsCustomBatch(
+      contentApi,
+      entries,
+      `delete batch ${start + 1}-${start + chunk.length} of ${total}`,
+    );
+    if (results === null) {
+      // Whole request failed (non-retryable) or a stop was requested. Errors are
+      // already logged; leave local records intact so the next run retries them.
+      continue;
+    }
+
+    const resultById = indexBatchResults(results);
+    const purgeable: string[] = [];
+    for (let i = 0; i < chunk.length; i += 1) {
+      const offerId = chunk[i];
+      const restId = entries[i].productId as string;
+      const position = start + i + 1;
+      const entry = resultById.get(i);
+      if (!entry) {
+        logApiError(`Failed to delete product ${restId}`, new Error('Missing batch response entry'));
+      } else if (!entry.errors) {
+        purgeable.push(offerId);
+        console.log(`Deleted product ${restId} (${position}/${total})`);
+      } else if (isNotFoundError(entry.errors)) {
+        // Already absent from Merchant Center (e.g. the offerId generation
+        // changed, or GMC expired it). The desired end state is reached; purge
+        // the local record so it stops being flagged stale on every run.
+        purgeable.push(offerId);
+        console.log(
+          `Product ${restId} already absent from Merchant Center; removed stale local record (${position}/${total})`,
         );
-        deleteVariantRecords(db, [offerId]);
-        console.log(`Deleted product ${restId} (${index + 1}/${offerIds.length})`);
-        break;
-      } catch (error) {
-        if (isNotFoundError(error)) {
-          // Product is already absent from Merchant Center (e.g. the offerId
-          // generation changed, so this stale record points at an ID that was
-          // never uploaded). The desired end state is reached; purge the local
-          // record so it stops being flagged stale and retried on every run.
-          deleteVariantRecords(db, [offerId]);
-          console.log(
-            `Product ${restId} already absent from Merchant Center; removed stale local record (${index + 1}/${offerIds.length})`,
-          );
-          break;
-        }
-        logApiError(`Failed to delete product ${restId}`, error);
-        if (!isNetworkError(error)) {
-          break;
-        }
-        const delayMs = getRetryDelayMs(attempt);
-        attempt += 1;
-        console.error(
-          colorizeRed(`Network issue detected. Retrying delete in ${Math.round(delayMs / 1000)}s...`),
-        );
-        await sleep(delayMs);
+      } else {
+        logApiError(`Failed to delete product ${restId}`, entry.errors);
       }
     }
+    deleteVariantRecords(db, purgeable);
   }
 }
 
@@ -1457,86 +1542,105 @@ async function createContentClient() {
   return google.content({ version: 'v2.1', auth: googleAuth });
 }
 
+function describeVariant(product: SchemaProduct): { displayTitle: string; variantLabel: string } {
+  const displayTitle = (product.title ?? 'n/a').replace(/\s+/g, ' ').trim() || 'n/a';
+  const displayColor = product.color ?? 'n/a';
+  const displaySize = product.sizes?.[0] ?? 'n/a';
+  const variantLabel = `title: ${displayTitle}, color: ${displayColor}, size: ${displaySize}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'}`;
+  return { displayTitle, variantLabel };
+}
+
 async function uploadProducts(
   items: UploadQueueItem[],
   merchantId: string,
   contentApi: content_v2_1.Content,
   db: SqliteDatabase,
   dryRun: boolean,
+  batchSize: number,
 ) {
   if (!items.length) {
     console.log('No product updates detected.');
     return;
   }
 
+  const total = items.length;
   const report = {
     success: 0,
     failed: 0,
   };
 
-  for (let index = 0; index < items.length; index += 1) {
+  for (let start = 0; start < total; start += batchSize) {
     if (isStopRequested()) {
       console.log('Stop requested. Halting product upload loop.');
       break;
     }
-    const { product, hash } = items[index];
-    const displayTitle = (product.title ?? 'n/a').replace(/\s+/g, ' ').trim() || 'n/a';
-    const displayColor = product.color ?? 'n/a';
-    const displaySize = product.sizes?.[0] ?? 'n/a';
-    const variantLabel = `title: ${displayTitle}, color: ${displayColor}, size: ${displaySize}, gender: ${product.gender ?? 'n/a'}, ageGroup: ${product.ageGroup ?? 'n/a'}`;
+    const chunk = items.slice(start, start + batchSize);
 
-    if (!product.offerId) {
-      console.warn('Skipping product with missing offerId.');
-      report.failed += 1;
-      continue;
-    }
-
-    if (dryRun) {
-      console.log(`[dry-run] (${index + 1}/${items.length}) Would upload product ${product.offerId} (${variantLabel})`);
-      report.success += 1;
-      continue;
-    }
-
-    let attempt = 0;
-    while (true) {
-      if (isStopRequested()) {
-        console.log('Stop requested. Halting product upload loop.');
-        break;
+    // Build the batch, skipping malformed items and short-circuiting dry runs.
+    const entries: content_v2_1.Schema$ProductsCustomBatchRequestEntry[] = [];
+    const entryItems: UploadQueueItem[] = [];
+    for (const item of chunk) {
+      const { product } = item;
+      if (!product.offerId) {
+        console.warn('Skipping product with missing offerId.');
+        report.failed += 1;
+        continue;
       }
-      try {
-        await withTimeout(
-          contentApi.products.insert({
-            merchantId,
-            requestBody: product,
-          }),
-          API_REQUEST_TIMEOUT_MS,
-          `upload product ${product.offerId} (${displayTitle})`,
-        );
-        console.log(`Uploaded product ${product.offerId} (${index + 1}/${items.length}) (${variantLabel})`);
+      if (dryRun) {
+        const { variantLabel } = describeVariant(product);
+        console.log(`[dry-run] Would upload product ${product.offerId} (${variantLabel})`);
         report.success += 1;
-        upsertVariantRecord(db, {
-          offerId: product.offerId,
+        continue;
+      }
+      entries.push({
+        batchId: entryItems.length,
+        merchantId,
+        method: 'insert',
+        product,
+      });
+      entryItems.push(item);
+    }
+
+    if (!entries.length) {
+      continue;
+    }
+
+    const results = await runProductsCustomBatch(
+      contentApi,
+      entries,
+      `upload batch ${start + 1}-${start + chunk.length} of ${total}`,
+    );
+    if (results === null) {
+      // Whole request failed (non-retryable) or a stop was requested. Count the
+      // batch as failed; nothing is recorded locally so the next run retries.
+      report.failed += entryItems.length;
+      continue;
+    }
+
+    const resultById = indexBatchResults(results);
+    const successfulRecords: CachedVariantRecord[] = [];
+    for (let i = 0; i < entryItems.length; i += 1) {
+      const { product, hash } = entryItems[i];
+      const { displayTitle, variantLabel } = describeVariant(product);
+      const entry = resultById.get(i);
+      if (!entry) {
+        logApiError(`Failed to upload product ${product.offerId} (${displayTitle})`, new Error('Missing batch response entry'));
+        report.failed += 1;
+      } else if (entry.errors) {
+        logApiError(`Failed to upload product ${product.offerId} (${displayTitle})`, entry.errors);
+        report.failed += 1;
+      } else {
+        report.success += 1;
+        console.log(`Uploaded product ${product.offerId} (${variantLabel})`);
+        successfulRecords.push({
+          offerId: product.offerId as string,
           itemGroupId: product.itemGroupId ?? undefined,
           hash,
           updatedAt: Date.now(),
         });
-        break;
-      } catch (error) {
-        logApiError(`Failed to upload product ${product.offerId} (${displayTitle})`, error);
-        if (!isNetworkError(error)) {
-          report.failed += 1;
-          break;
-        }
-        const delayMs = getRetryDelayMs(attempt);
-        attempt += 1;
-        console.error(
-          colorizeRed(`Network issue detected. Retrying upload in ${Math.round(delayMs / 1000)}s...`),
-        );
-        await sleep(delayMs);
       }
     }
-
-    // break;
+    upsertVariantRecords(db, successfulRecords);
   }
 
   console.log(
@@ -1650,11 +1754,13 @@ async function main() {
 
     const contentApi = await createContentClient();
 
+    console.log(`Using custombatch with batch size ${cliOptions.batchSize}.`);
+
     if (staleOfferIds.length) {
-      await deleteStaleProducts(staleOfferIds, merchantId, mappingOptions, contentApi, db, cliOptions.dryRun);
+      await deleteStaleProducts(staleOfferIds, merchantId, mappingOptions, contentApi, db, cliOptions.dryRun, cliOptions.batchSize);
     }
 
-    await uploadProducts(uploadQueue, merchantId, contentApi, db, cliOptions.dryRun);
+    await uploadProducts(uploadQueue, merchantId, contentApi, db, cliOptions.dryRun, cliOptions.batchSize);
   } finally {
     if (db) {
       db.close();
