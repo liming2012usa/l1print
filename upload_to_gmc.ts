@@ -1,6 +1,6 @@
 import { readFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import DatabaseConstructor from 'better-sqlite3';
 import { google, content_v2_1 } from 'googleapis';
@@ -1775,10 +1775,33 @@ async function main() {
   process.exit(exitCode);
 }
 
-main().catch((error) => {
-  console.error('Fatal error while syncing Google Merchant Center products:', error);
-  process.exit(1);
-});
+// Only run the sync when executed directly (e.g. `tsx upload_to_gmc.ts`), not
+// when imported by unit tests.
+const isMainModule = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch((error) => {
+    console.error('Fatal error while syncing Google Merchant Center products:', error);
+    process.exit(1);
+  });
+}
+
+export {
+  isNotFoundError,
+  isNetworkError,
+  parseBatchSize,
+  parseLimit,
+  createRestProductId,
+  indexBatchResults,
+  buildVariantOfferId,
+  hashProduct,
+  upsertVariantRecords,
+  deleteVariantRecords,
+  loadCachedVariants,
+  runProductsCustomBatch,
+  uploadProducts,
+  deleteStaleProducts,
+};
+export type { MappingOptions, CachedVariantRecord, UploadQueueItem, SqliteDatabase };
 function logApiError(context: string, error: unknown) {
   if (error && typeof error === 'object' && 'errors' in (error as Record<string, unknown>)) {
     const errObj = error as {

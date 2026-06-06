@@ -8,7 +8,8 @@
     "build": "tsc",
     "upload:gmc": "npm run build --silent && node dist/upload_to_gmc.js --limit 3",
     "upload:gmc:ts": "npx tsx upload_to_gmc.ts --limit 3000",
-    "delete:gmc": "npx tsx delete_products.ts --file data_feeds/products-delete.xml"
+    "delete:gmc": "npx tsx delete_products.ts --file data_feeds/products-delete.xml",
+    "test": "node --import tsx --test upload_to_gmc.test.ts"
   },
   "dependencies": {
     "adm-zip": "^0.5.10",
