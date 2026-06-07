@@ -8,6 +8,7 @@
     "build": "tsc",
     "upload:gmc": "npm run build --silent && node dist/upload_to_gmc.js --limit 3",
     "upload:gmc:ts": "npx tsx upload_to_gmc.ts --limit 3000",
+    "dry-run": "npx tsx upload_to_gmc.ts --dry-run",
     "delete:gmc": "npx tsx delete_products.ts --file data_feeds/products-delete.xml",
     "typecheck": "tsc --noEmit",
     "pretest": "npm run typecheck",
